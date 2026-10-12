@@ -115,6 +115,23 @@ Hook payloads are read defensively and by keyword; a hook whose payload changes 
 python3 -m pytest tests/     # 36 tests, no network, no Hermes install required
 ```
 
+## Verification
+
+Beyond the unit tests, two independent end-to-end results back this plugin (both on an **unmodified**
+Hermes v0.21.6 checkout):
+
+1. **Upstream gate** — `hermes plugins validate .` passes in full: manifest fields, `requires_hermes`,
+   `config_schema`, the capability probe (`register()` run in isolation, declared hooks/middleware
+   matching registrations), security scan, and "no core override".
+2. **Standalone turn + real engine** — installed as the *only* plugin into a clean `HERMES_HOME`
+   (no bundle, no companion plugins), a real `hermes -z` turn produced two `X-Agent-Hint` headers
+   (`call_index` 1→2) and the event sequence `running → tool → running → finalize`; with the plugin
+   disabled the same run was completely silent. The header bytes emitted by this plugin's own
+   `_builder`/`_codec` were then sent to a MindIE-Motor scheduler, whose log shows the session being
+   pinned — `session affinity hit session_id=… instance_id=4` after a first request with
+   `prio=3 aff=fresh` and a second with `prio=3 aff=hit`, while an identical request without the
+   header logged `prio=None aff=-`.
+
 ## License
 
 MIT — see `LICENSE`.

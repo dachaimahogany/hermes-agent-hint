@@ -1,0 +1,132 @@
+"""配置面（进程级快照）：env 与 plugins.entries.agent-hint.settings 二源合一。
+
+优先级 settings > env > 缺省；register(ctx) 时 bind(ctx) 一次，之后全部读内存快照，
+避免在热路径（每次 API 请求 / hook）重复走 ctx.get_config 的磁盘读。
+"""
+import json
+import os
+
+_ENV_PREFIX = "AGENT_HINT_"
+
+_DEFAULTS = {
+    "enabled": "0",
+    "agent_type": "hermes",
+    "priority_level": "3",
+    "priority_reason": "user_waiting",
+    "status_sink": "",
+    "status_url": "",
+    "finalize_on": "session_end",
+    "suspend_after_s": "0",
+    "cache_pin_end": "1",
+    "next_action_map": "",
+}
+
+_ctx = None
+_snapshot = None
+
+
+def _truthy(v):
+    return str(v).strip().lower() in ("1", "true", "yes", "on", "enabled")
+
+
+def _int(v, default=0):
+    try:
+        return int(str(v).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def bind(ctx):
+    """register(ctx) 时调用一次；随后 load 全量快照。"""
+    global _ctx
+    _ctx = ctx
+
+
+def _load():
+    global _snapshot
+    out = {}
+    for key, default in _DEFAULTS.items():
+        val = None
+        if _ctx is not None:
+            try:
+                val = _ctx.get_config(key, None)
+            except Exception:
+                val = None
+        if val is None:
+            val = os.environ.get(_ENV_PREFIX + key.upper(), None)
+        if val is None:
+            val = default
+        out[key] = val
+    _snapshot = out
+    return out
+
+
+def _reset():
+    """测试/回收辅助：清空快照以强制下次读取重新加载。"""
+    global _snapshot
+    _snapshot = None
+
+
+def _get(key):
+    if _snapshot is None:
+        _load()
+    return _snapshot.get(key, _DEFAULTS.get(key))
+
+
+def enabled():
+    return _truthy(_get("enabled"))
+
+
+def agent_type():
+    return str(_get("agent_type") or "hermes")
+
+
+def priority():
+    """priority 段；level<=0 或空 -> None（整段省略）。"""
+    level = _int(_get("priority_level"), 0)
+    if level <= 0:
+        return None
+    reason = str(_get("priority_reason") or "").strip() or "user_waiting"
+    return {"level": level, "reason": reason}
+
+
+def status_sink():
+    raw = str(_get("status_sink") or "").strip().lower()
+    if raw in ("ndjson", "http", "none"):
+        return raw
+    return "http" if status_url() else "none"
+
+
+def status_url():
+    return str(_get("status_url") or "").strip()
+
+
+def finalize_on():
+    v = str(_get("finalize_on") or "session_end").strip().lower()
+    return v if v in ("session_end", "session_finalize") else "session_end"
+
+
+def suspend_after_s():
+    return max(0, _int(_get("suspend_after_s"), 0))
+
+
+def cache_pin_end():
+    return max(0, _int(_get("cache_pin_end"), 1))
+
+
+def next_action_map():
+    """prediction.next_action 的**通用**映射（JSON 字符串，默认为空）。
+
+    形如 ``{"<最近工具名前缀>": ["<下一步工具名>", <剩余调用数>, "<state>"], "__default__": [...]}``；
+    键按长度降序匹配（最长前缀优先），``__default__`` 为兜底键。
+    空值/非法 JSON -> ``{}``，此时整段省略 next_action/remaining_calls（不猜）。
+    该字段是启发式估计，不是埋点统计量：网关不应把它当高置信信号使用。
+    """
+    raw = str(_get("next_action_map") or "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}

@@ -1,0 +1,64 @@
+name: agent-hint
+version: "0.5.1"
+author: dachaimahogany
+description: "Agent Hint：为每次主 LLM 请求注入标准 X-Agent-Hint 头（base64url JSON），
+  并向推理引擎异步上报 agent_status 生命周期事件（零侵入、纯标准库、可装卸、默认关闭）。"
+requires_hermes: ">=0.21.6"
+tags: [agent-hint, inference-engine, scheduling, observability, middleware]
+
+# 声明的能力必须与 register(ctx) 的真实注册一一对应（上游能力探针会校验）。
+provides_hooks:
+  - on_session_start
+  - on_session_end
+  - on_session_finalize
+  - pre_tool_call
+  - post_tool_call
+  - pre_approval_request
+  - post_approval_response
+  - subagent_start
+  - subagent_stop
+  - post_api_request
+provides_middleware:
+  - llm_request
+
+# 所有键均为可选（默认值即安全缺省）；优先级：plugins.entries.agent-hint.settings > AGENT_HINT_<KEY> 环境变量 > 内置缺省。
+config_schema:
+  enabled:
+    type: bool
+    required: false
+    description: "总开关。默认 false：不注入头、不发事件（中间件与 hooks 在入口早退）。"
+  agent_type:
+    type: str
+    required: false
+    description: "写入 session.agent_type 的 agent 类别标识；默认 hermes。多 agent 部署时按角色设置。"
+  priority_level:
+    required: false
+    description: "priority.level（整数，<=0 表示整段省略 priority）。默认 3。"
+  priority_reason:
+    type: str
+    required: false
+    description: "priority.reason 文本。默认 user_waiting。"
+  status_sink:
+    type: str
+    required: false
+    description: "状态事件出口：ndjson | http | none。默认 none（不落盘、不发网络）；配置 status_url 后默认 http。"
+  status_url:
+    type: str
+    required: false
+    description: "http 出口的目标 URL（POST JSON）。留空则不发任何网络请求。"
+  finalize_on:
+    type: str
+    required: false
+    description: "finalize 事件触发时机：session_end | session_finalize。默认 session_end。"
+  suspend_after_s:
+    required: false
+    description: "审批挂起超过该秒数后补发 suspend 事件（整数，0=不启用）。默认 0。"
+  cache_pin_end:
+    required: false
+    description: "cache_control.pin.range.end 的取值（整数，0=不带 range）。默认 1。"
+  next_action_map:
+    type: str
+    required: false
+    description: "prediction.next_action 的通用映射（JSON 字符串），如
+      {\"research_\": [\"analysis_run\", 8, \"tool\"], \"__default__\": [null, 0, \"tool\"]}。
+      留空（默认）则整段省略 next_action/remaining_calls。"

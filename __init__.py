@@ -31,7 +31,10 @@ def register(ctx):
 # --- 工具函数 ---
 
 def _sid(kw):
-    """会话标识：上游大多数 hook 传 ``session_id``；审批类 hook 传 ``session_key``（两者都认）。"""
+    """会话标识：多数 hook 传 ``session_id``；审批类 hook 在调用点传 ``session_key``，
+    并在 observability context 已绑定时由 dispatcher 额外补上 ``session_id``
+    （见上游 ``tools/approval_context.py::_fire_approval_hook``；未绑定时该键不存在）。
+    两者都认，取到哪个用哪个。"""
     return str(kw.get("session_id") or kw.get("session_key") or "")
 
 

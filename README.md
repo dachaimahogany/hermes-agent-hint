@@ -33,7 +33,7 @@ capacity for a session that is about to resume.
 ### Measured impact
 
 Not a hypothesis — measured against a MindIE-Motor deployment serving Qwen3-8B on an 8-card
-Ascend 910-class NPU server (vLLM engines, prefix caching on):
+Ascend 910B4 NPU server (vLLM engines, prefix caching on):
 
 | What was measured | No hint | With hint |
 |---|---|---|
@@ -194,7 +194,7 @@ OpenAI 兼容的 HTTP API 里没有「会话」这个概念。但 agent 有：�
 
 ### 实测影响
 
-这不是推测 —— 在一套 MindIE-Motor 部署上实测（8 卡 Ascend 910 级 NPU 服务器，服务 Qwen3-8B，
+这不是推测 —— 在一套 MindIE-Motor 部署上实测（8 卡 Ascend 910B4 NPU 服务器，服务 Qwen3-8B，
 vLLM 引擎开启前缀缓存）：
 
 | 测什么 | 无 hint | 带 hint |

@@ -1,6 +1,6 @@
 # 为什么 agent 会话需要一个 hint：实测影响
 
-> 在 8 卡 Ascend 910 级 NPU 服务器上，通过 MindIE-Motor 部署（vLLM 引擎 + 前缀缓存）服务
+> 在 8 卡 Ascend 910B4 NPU 服务器上，通过 MindIE-Motor 部署（vLLM 引擎 + 前缀缓存）服务
 > Qwen3-8B，对 **agent-hint** 做的前缀缓存冷暖对照 benchmark 与真机路由验证。
 >
 > **English version: [benchmark-report.md](benchmark-report.md)**
@@ -51,7 +51,7 @@ OpenAI 兼容的请求体表达不了这件事 —— 它没有会话字段，�
 
 | 项 | 值 |
 | --- | --- |
-| NPU | 8 卡，Ascend 910 级（共 16 chip，每卡 2 chip），单卡 HBM 64 GB（实测运行中占用 56–59 GB） |
+| NPU | 8 卡 Ascend 910B4（共 16 chip，每卡 2 chip），单卡 HBM 64 GB（实测运行中占用 56–59 GB） |
 | 主机 | openEuler 24.03 LTS，aarch64，320 核，2 TB 内存 |
 | 服务栈 | MindIE-Motor —— 控制器 + 协调器 + 2 个 vLLM 引擎实例（`union×2`），已启用会话亲和 |
 | 引擎 | vllm-ascend 0.25.1，开启前缀缓存，`max_model_len=8192` |
@@ -186,6 +186,9 @@ NVIDIA 公开发布的 Dynamo agentic 推理结果表明：首次调用把对话
 - **真实 agent 进程内的多轮 `aff=hit` 路径本轮未走通：** 引擎对该 harness 的工具调用格式返回了
   SSE 空流（引擎侧 tool-call-parser / thinking 模式不匹配，非插件问题）。因此命中路径是通过回放插件的
   **真实 header 字节**在真机引擎上验证的 —— 而两条路径的 header 字节完全一致，这正是回放有意义的原因。
+- **协调器级路由数据是经由一个等价协调器实例采集的。** 测量时我们自己的协调器推理转发处于挂起
+  状态（环境问题，次日已修复），因此那段 8 轮路由序列是通过第二套等价协调器采集的，二者跑的是同一
+  套代码路径。也就是说：测到的路由行为属于同一套调度器实现，但并非 §2 中具名的那一个实例。
 - **并发会话在部分轮次丢失亲和**（非首轮也出现多个 `aff=fresh`）—— 待查项；同一套栈上另一个 agent
   harness 也出现过同类现象，怀疑在 provider 侧的并发派发。
 - **一处引擎侧解析差异：** 真机某个 header 携带优先级 level 3 却记成 `prio=1`，而同一 header 回放记为

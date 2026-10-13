@@ -1,7 +1,7 @@
 # Why agent sessions need a hint: measured impact
 
 > A cold/warm prefix-cache benchmark and a live routing test of **agent-hint**, run on an
-> 8-card Ascend 910-class NPU server serving Qwen3-8B through a MindIE-Motor deployment
+> 8-card Ascend 910B4 NPU server serving Qwen3-8B through a MindIE-Motor deployment
 > (vLLM engines with prefix caching enabled).
 >
 > **中文版：[benchmark-report.zh-CN.md](benchmark-report.zh-CN.md)**
@@ -63,7 +63,7 @@ exists.
 
 | Item | Value |
 | --- | --- |
-| NPU | 8 cards, Ascend 910-class (16 chips, 2 per card), 64 GB HBM per card (56–59 GB resident during the run) |
+| NPU | 8 cards, Ascend 910B4 (16 chips, 2 per card), 64 GB HBM per card (56–59 GB resident during the run) |
 | Host | openEuler 24.03 LTS, aarch64, 320 CPU cores, 2 TB RAM |
 | Serving stack | MindIE-Motor — controller + coordinator + 2 vLLM engine instances (`union×2`), session affinity enabled |
 | Engine | vllm-ascend 0.25.1, prefix caching enabled, `max_model_len=8192` |
@@ -217,6 +217,11 @@ Stated plainly, because a report that only lists wins is not useful:
   tool-call-parser / thinking-mode mismatch, not a plugin issue). The hit path was therefore
   verified by replaying the plugin's **real header bytes** through a real engine — and the header
   bytes are identical between the two paths, which is what makes the replay meaningful.
+- **Coordinator-level routing data came through an equivalent coordinator instance.** Our own
+  coordinator's inference forwarding was hung at measurement time — an environment issue, repaired
+  the next day — so the 8-round routing sequence was collected through a second, equivalent
+  coordinator running the same code path. The measured routing behaviour is therefore the
+  behaviour of the same scheduler implementation, but not of the exact instance named in §2.
 - **Concurrent sessions lost affinity in some rounds** (multiple `aff=fresh` for non-first
   rounds) — open item, a phenomenon also seen with another agent harness against the same stack,
   suspected to be in concurrent dispatch on the provider side.

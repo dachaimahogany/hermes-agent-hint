@@ -1,8 +1,10 @@
 name: agent-hint
 version: "0.5.1"
 author: dachaimahogany
-description: "Agent Hint：为每次主 LLM 请求注入标准 X-Agent-Hint 头（base64url JSON），
-  并向推理引擎异步上报 agent_status 生命周期事件（零侵入、纯标准库、可装卸、默认关闭）。"
+description: "Gives the inference engine a machine-readable view of the agent session behind each
+  request: adds a standard X-Agent-Hint header (base64url JSON) to main LLM requests and can report
+  agent_status lifecycle events out of band. Never touches the request body, stdlib-only, removable,
+  off by default."
 requires_hermes: ">=0.21.6"
 tags: [agent-hint, inference-engine, scheduling, observability, middleware]
 
@@ -26,39 +28,45 @@ config_schema:
   enabled:
     type: bool
     required: false
-    description: "总开关。默认 false：不注入头、不发事件（中间件与 hooks 在入口早退）。"
+    description: "Master switch. Default false: no header is injected and no events are sent
+      (the middleware and every hook return early)."
   agent_type:
     type: str
     required: false
-    description: "写入 session.agent_type 的 agent 类别标识；默认 hermes。多 agent 部署时按角色设置。"
+    description: "Value written to session.agent_type (the agent/role label). Default: hermes.
+      Set per role in multi-agent deployments."
   priority_level:
     required: false
-    description: "priority.level（整数，<=0 表示整段省略 priority）。默认 3。"
+    description: "priority.level (integer; <= 0 omits the whole priority block). Default: 3."
   priority_reason:
     type: str
     required: false
-    description: "priority.reason 文本。默认 user_waiting。"
+    description: "priority.reason text. Default: user_waiting."
   status_sink:
     type: str
     required: false
-    description: "状态事件出口：ndjson | http | none。默认 none（不落盘、不发网络）；配置 status_url 后默认 http。"
+    description: "Event transport: ndjson | http | none. Default: none (nothing written locally,
+      no network). Setting status_url makes http the default."
   status_url:
     type: str
     required: false
-    description: "http 出口的目标 URL（POST JSON）。留空则不发任何网络请求。"
+    description: "Target URL for the http sink (JSON POST). Empty = no network requests at all."
   finalize_on:
     type: str
     required: false
-    description: "finalize 事件触发时机：session_end | session_finalize。默认 session_end。"
+    description: "When to emit the finalize event: session_end | session_finalize.
+      Default: session_end."
   suspend_after_s:
     required: false
-    description: "审批挂起超过该秒数后补发 suspend 事件（整数，0=不启用）。默认 0。"
+    description: "Emit a suspend event once an approval has been pending this many seconds
+      (integer; 0 = disabled). Default: 0."
   cache_pin_end:
     required: false
-    description: "cache_control.pin.range.end 的取值（整数，0=不带 range）。默认 1。"
+    description: "Value used for cache_control.pin.range.end (integer; 0 = omit the range).
+      Default: 1."
   next_action_map:
     type: str
     required: false
-    description: "prediction.next_action 的通用映射（JSON 字符串），如
-      {\"research_\": [\"analysis_run\", 8, \"tool\"], \"__default__\": [null, 0, \"tool\"]}。
-      留空（默认）则整段省略 next_action/remaining_calls。"
+    description: "Generic prediction.next_action mapping (JSON string), e.g.
+      {\"research_\": [\"analysis_run\", 8, \"tool\"], \"__default__\": [null, 0, \"tool\"]}.
+      Empty (the default) omits next_action and remaining_calls entirely."

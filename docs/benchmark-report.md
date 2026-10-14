@@ -16,7 +16,7 @@
 
 1. **The engine can reuse a session's prefix — but only on the instance that holds it.**
    Measured with the engine's own counter: a cold request (fresh prefix) hits **0.0%** of its
-   prefix tokens in cache; a warm one (same prefix, same instance) hits **84–99%**.
+   prefix tokens in cache; a warm one (same prefix, same instance) hits **83–100%**.
 2. **Without a hint, the scheduler cannot tell two requests belong to the same session** — an
    OpenAI-compatible body carries `model` / `messages` / `tools` and nothing about session
    identity. Measured: 6 identical requests landed on the two engine instances **3:3**, with
@@ -195,7 +195,7 @@ KV-aware/session-aware routing delivered a **4× reduction in p50 TTFT** versus 
 
 Two readings matter here:
 
-- **The mechanism agrees.** Our 84–99% measured hit rate sits inside their 85–97% band, on
+- **The mechanism agrees.** Our 83–100% measured hit rate overlaps their 85–97% band (same order of magnitude), on
   entirely different hardware and a different engine. Session stickiness → prefix reuse is the
   same lever everywhere; it is not a vendor-specific trick.
 - **The magnitude is a hardware property, not a mechanism property.** We measured 1.30× where

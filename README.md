@@ -81,6 +81,8 @@ Every key is optional — the defaults are the safe defaults.
 | `finalize_on` | `session_end` | When to emit `finalize`: `session_end` or `session_finalize`. |
 | `suspend_after_s` | `0` | Emit `suspend` if an approval stays pending this long. `0` disables. |
 | `cache_pin_end` | `1` | `cache_control.pin.range.end`; `0` omits the range. |
+| `cache_ttl_s` | `auto` | Retention seconds for the ephemeral range. `auto` derives it from the observed gap (next tool budget, else the inter-call interval, else 300 s, doubled and clamped to 60–3600); `0` sends only the pin; a number fixes it. |
+| `cache_task_end` | `0` | Message index of the task-description end; a second, wider breakpoint. `0` emits only one. |
 | `next_action_map` | *(empty)* | Generic `prediction.next_action` heuristic (JSON). Empty = omit. |
 
 Example:
@@ -241,6 +243,8 @@ hermes plugins enable agent-hint
 | `finalize_on` | `session_end` | 何时发射 `finalize`：`session_end` 或 `session_finalize`。 |
 | `suspend_after_s` | `0` | 审批挂起超过该秒数时发射 `suspend`；`0` 关闭。 |
 | `cache_pin_end` | `1` | `cache_control.pin.range.end`；`0` 则不带 range。 |
+| `cache_ttl_s` | `auto` | ephemeral 保留秒数。`auto` 按运行时信号推导（下一次工具预算 → 请求间隔 → 默认 300s，乘 2 后钳到 60–3600）；`0` 只发 pin；填数字则固定。 |
+| `cache_task_end` | `0` | 任务说明末尾的消息下标，作为第二条更宽的断点；`0` 只发一条。 |
 | `next_action_map` | *(空)* | 通用的 `prediction.next_action` 启发式（JSON）。留空 = 不发射。 |
 
 示例：

@@ -167,14 +167,30 @@ def _on_llm_request(**kw):
         if resumed:  # M4：finalize -> running 边，补发 running 事件
             _sink.emit(_builder.status_event(sid, "running", since_ms=since_ms))
         parent_session_id, derivation = _state.lineage(sid)
+        # 一次快照同时喂 prediction 与 TTL 推导，避免重复统计。
+        prediction = _stats.snapshot(sid, next_action_map=_settings.next_action_map())
+        ttl_s = _settings.cache_ttl_s()
+        if ttl_s is None:
+            observed = prediction or {}
+            next_action = observed.get("next_action") or {}
+            tools = next_action.get("tools") or []
+            ttl_s = _builder.estimate_ttl_s(
+                tool_expected_duration_s=tools[0].get("expected_duration_s") if tools else None,
+                interval_ms=observed.get("interval_ms"),
+            )
         hint = _builder.request_hint(
             session_id=sid, call_index=call_index, epoch=epoch,
             agent_type=_state.agent_type(sid, _settings.agent_type()),
             parent_session_id=parent_session_id, derivation=derivation,
             state=state, state_since_ms=since_ms,
             priority=_settings.priority(),
-            cache_control=_builder.cache_control(req, end=_settings.cache_pin_end()),
-            prediction=_stats.snapshot(sid, next_action_map=_settings.next_action_map()),
+            cache_control=_builder.cache_control(
+                req,
+                end=_settings.cache_pin_end(),
+                ttl_s=ttl_s or 0,
+                task_end=_settings.cache_task_end() or None,
+            ),
+            prediction=prediction,
         )
         req = dict(req)  # 浅拷贝顶层（COW，绝不改入参）
         headers = dict(req.get("extra_headers") or {})

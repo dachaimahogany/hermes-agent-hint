@@ -18,6 +18,8 @@ _DEFAULTS = {
     "finalize_on": "session_end",
     "suspend_after_s": "0",
     "cache_pin_end": "1",
+    "cache_ttl_s": "auto",
+    "cache_task_end": "0",
     "next_action_map": "",
 }
 
@@ -112,6 +114,28 @@ def suspend_after_s():
 
 def cache_pin_end():
     return max(0, _int(_get("cache_pin_end"), 1))
+
+
+def cache_ttl_s():
+    """ephemeral 保留秒数：None=按运行时信号推导（默认），0=只发 pin，正整数=固定值。
+
+    固定值按 Motor 的钳制口径校验：低于 60 无效、超过 3600 超协议上限；两者都按 0 处理
+    ——宁可不声明，也不发一个会被消费侧静默改写的值。
+    """
+    raw = str(_get("cache_ttl_s") or "").strip().lower()
+    if raw in ("", "auto", "none", "null"):
+        return None
+    ttl = _int(raw, 0)
+    if ttl <= 0:
+        return 0
+    if ttl < 60 or ttl > 3600:
+        return 0
+    return ttl
+
+
+def cache_task_end():
+    """第二条断点（任务说明末尾）的消息下标；0（缺省）= 不产出第二条断点。"""
+    return max(0, _int(_get("cache_task_end"), 0))
 
 
 def next_action_map():

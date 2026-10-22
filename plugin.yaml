@@ -1,5 +1,5 @@
 name: agent-hint
-version: "0.5.1"
+version: "0.6.0"
 author: dachaimahogany
 description: "Gives the inference engine a machine-readable view of the agent session behind each
   request: adds a standard X-Agent-Hint header (base64url JSON) to main LLM requests and can report
@@ -62,7 +62,8 @@ config_schema:
       (integer; 0 = disabled). Default: 0."
   cache_pin_end:
     required: false
-    description: "Value used for cache_control.pin.range.end (integer; 0 = omit the range).
+    description: "Breakpoint position (range.end) of the single ephemeral declaration
+      (integer; 0 = omit the range). Historical name kept for config compatibility.
       Default: 1."
   next_action_map:
     type: str

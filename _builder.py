@@ -76,16 +76,18 @@ def estimate_ttl_s(tool_expected_duration_s=None, interval_ms=None):
 
 
 def cache_control(request, end=1, ttl_s=0, task_end=None):
-    """会话前缀的保留声明（pin 稳定前缀 + 可选 ephemeral 保活）。
+    """会话前缀的保留声明：**单一断点 + 显式 TTL**。
 
-    断点规则（交接文档 §3.2）：断点 1 = 稳定前缀末尾（system + 工具定义），
-    断点 2 = 任务说明末尾（``task_end``，由调用方按自己的消息结构定位）。
-    两条断点共享同一 ``range.unit="message"`` 坐标；当前轮对话永远不打断点。
+    只有一条断点，`pin` 已退役：
+    - 消费侧从不区分 ``type``（只记日志），而 ``pin`` 这个名字暗示一个硬保证，
+      没有任何一层能兑现；Dynamo 已移除等价字段，vLLM RFC 也已放弃 Pin。
+    - 第二条断点在消费侧被折叠成"最宽 end + 最长显式 TTL"，不产生额外行为，
+      只会多占 header 预算。
 
-    - ``ttl_s <= 0`` 时不产出 ephemeral 条目：只有显式 TTL 才进入消费侧生命周期
-      （Motor 契约：无 ttl 的声明不入表），因此 pin 保持最小形态。
-    - ``task_end`` 为空/不大于 ``end``/越界时不产出第二条断点——不猜位置。
+    断点位置：``task_end`` 合法且比 ``end`` 更宽时取它（保护到任务说明末尾），
+    否则取 ``end``（稳定前缀末尾）。当前轮对话永远不打断点。
 
+    ``ttl_s <= 0`` 时不产出任何条目——没有 TTL 就没有可声明的保留。
     ``request`` 含合法 messages 才产出，否则 None（畸形输入绝不抛错）。
     """
     messages = request.get("messages") if isinstance(request, dict) else None
@@ -94,16 +96,14 @@ def cache_control(request, end=1, ttl_s=0, task_end=None):
     if end > len(messages):
         # 断点越界：消费侧会整条丢弃 range，这里宁可不发也不发一个错位的声明。
         return None
+    if ttl_s <= 0:
+        return None
 
-    controls = [{"type": "pin", "range": {"end": end, "unit": "message"}}]
-    if ttl_s > 0:
-        controls.append({
-            "type": "ephemeral",
-            "ttl_s": ttl_s,
-            "range": {"end": end, "unit": "message"},
-        })
-    # 第二条断点保护到任务上下文为止。它必须比第一条更宽才是一个真正的嵌套前缀；
-    # 等于第一条只是重复声明，因此要求严格大于。
+    target = end
     if isinstance(task_end, int) and end < task_end <= len(messages):
-        controls[-1]["range"]["end"] = task_end
-    return controls
+        target = task_end
+    return [{
+        "type": "ephemeral",
+        "ttl_s": ttl_s,
+        "range": {"end": target, "unit": "message"},
+    }]

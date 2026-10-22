@@ -15,6 +15,18 @@ _lock = threading.Lock()  # collect/note_tool 跑 worker 线程、snapshot 跑 a
 _samples = defaultdict(deque)  # session_id -> deque(sample)
 _last_ended_at = {}  # session_id -> ended_at（interval 近似用）
 _last_tool = {}  # session_id -> 最近工具名
+_tool_started = {}  # session_id -> 工具开始时刻（monotonic）
+_tool_durations = defaultdict(deque)  # 工具名 -> deque(耗时秒)，跨会话共享
+
+
+def _p90(values):
+    """最近样本的 p90；样本不足时返回 None。"""
+    xs = sorted(values)
+    if not xs:
+        return None
+    k = (len(xs) - 1) * 0.9
+    lo, hi = int(k), min(int(k) + 1, len(xs) - 1)
+    return xs[lo] + (xs[hi] - xs[lo]) * (k - lo)
 
 
 def _reset():
@@ -23,13 +35,36 @@ def _reset():
         _samples.clear()
         _last_ended_at.clear()
         _last_tool.clear()
+        _tool_started.clear()
+        _tool_durations.clear()
 
 
 def note_tool(sid, name):
-    """记录最近工具名（SOP 启发式数据源；pre_tool_call 调用）。"""
+    """记录最近工具名与开始时刻（pre_tool_call 调用）。"""
     if sid and name:
         with _lock:
             _last_tool[str(sid)] = str(name)
+            _tool_started[str(sid)] = time.monotonic()
+
+
+def note_tool_done(sid):
+    """工具结束时结算耗时，按工具名累积（post_tool_call 调用）。
+
+    没有这一步就只能给 ``expected_duration_s`` 填一个常数，而常数会让 TTL 永远
+    落在协议下限，工具超过一分钟的等待必然失效。
+    """
+    key = str(sid or "")
+    if not key:
+        return
+    with _lock:
+        started = _tool_started.pop(key, None)
+        name = _last_tool.get(key)
+        if started is None or not name:
+            return
+        elapsed = max(0.0, time.monotonic() - started)
+        _tool_durations[name].append(elapsed)
+        while len(_tool_durations[name]) > _MAX_SAMPLES:
+            _tool_durations[name].popleft()
 
 
 def collect(session_id=None, usage=None, api_duration=None, first_chunk_at=None,
@@ -134,7 +169,12 @@ def snapshot(sid, next_action_map=None):
     if next_state is not None:
         na = {"state": next_state, "prob": 0.5}
         if next_name:
-            na["tools"] = [{"name": next_name, "expected_duration_s": 5}]
+            with _lock:
+                observed = list(_tool_durations.get(next_name) or ())
+            p90 = _p90(observed)
+            # 有实测就发实测的 p90，样本不足才退回常数 5 秒（保守：宁可短，不虚构长保留）。
+            expected = max(1, int(round(p90))) if p90 is not None and len(observed) >= 3 else 5
+            na["tools"] = [{"name": next_name, "expected_duration_s": expected}]
         pred["next_action"] = na
         if remaining is not None:
             pred["remaining_calls"] = int(remaining)

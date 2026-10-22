@@ -104,10 +104,11 @@ def test_status_event_reason_tools_optional(ah_plugin):
     assert e2["agent_status"]["tools"][0]["call_id"] == "c1"
 
 
-def test_cache_control_pin(ah_plugin):
+def test_cache_control_requires_explicit_ttl(ah_plugin):
     b = ah_plugin._builder
     req = {"messages": [{"role": "system"}, {"role": "user"}]}
-    assert b.cache_control(req, end=1) == [{"type": "pin", "range": {"end": 1, "unit": "message"}}]
+    # pin 已退役：没有显式 TTL 就没有可声明的保留
+    assert b.cache_control(req, end=1) is None
     assert b.cache_control({"messages": []}, end=1) is None
     assert b.cache_control({"no": "messages"}, end=1) is None
     assert b.cache_control({"messages": [{"role": "system"}]}, end=0) is None
@@ -120,22 +121,21 @@ def test_cache_control_ephemeral_carries_ttl(ah_plugin):
     req = {"messages": [{"role": "system"}, {"role": "user"}, {"role": "assistant"}]}
     controls = b.cache_control(req, end=1, ttl_s=120)
     assert controls == [
-        {"type": "pin", "range": {"end": 1, "unit": "message"}},
         {"type": "ephemeral", "ttl_s": 120, "range": {"end": 1, "unit": "message"}},
     ]
-    # ttl_s<=0：只有 pin，不产出 ephemeral（显式 TTL 才进生命周期）
-    assert b.cache_control(req, end=1, ttl_s=0) == [{"type": "pin", "range": {"end": 1, "unit": "message"}}]
+    # ttl_s<=0：不发任何条目（单一断点 + 显式 TTL 是唯一形态）
+    assert b.cache_control(req, end=1, ttl_s=0) is None
 
 
 def test_cache_control_second_breakpoint_widens_the_ephemeral(ah_plugin):
     b = ah_plugin._builder
     req = {"messages": [{"role": f"m{i}"} for i in range(6)]}
     controls = b.cache_control(req, end=2, ttl_s=300, task_end=5)
-    assert controls[1] == {"type": "ephemeral", "ttl_s": 300, "range": {"end": 5, "unit": "message"}}
-    # task_end 不大于 end 时不算第二条断点（等于只是重复声明）
-    assert b.cache_control(req, end=2, ttl_s=300, task_end=2)[1]["range"]["end"] == 2
+    assert controls == [{"type": "ephemeral", "ttl_s": 300, "range": {"end": 5, "unit": "message"}}]
+    # task_end 不大于 end 时不加宽（等于只是重复声明）
+    assert b.cache_control(req, end=2, ttl_s=300, task_end=2)[0]["range"]["end"] == 2
     # task_end 越界时不采信
-    assert b.cache_control(req, end=2, ttl_s=300, task_end=99)[1]["range"]["end"] == 2
+    assert b.cache_control(req, end=2, ttl_s=300, task_end=99)[0]["range"]["end"] == 2
 
 
 def test_cache_ttl_distinguishes_auto_pin_only_and_fixed(ah_plugin, monkeypatch):
@@ -390,9 +390,9 @@ def test_middleware_injects_header_cow(ah_plugin, monkeypatch):
     hint = ah_plugin._codec.decode(result["request"]["extra_headers"]["X-Agent-Hint"])
     assert hint["session"]["call_index"] == 1
     assert hint["agent_status"]["state"] == "running"
-    # 默认 auto：没有可用的运行时信号时按协议默认 gap（300s * 2）声明保留窗口
+    # 默认 auto：没有可用的运行时信号时按协议默认 gap（300s * 2）声明保留窗口；
+    # pin 已退役，只发一条 ephemeral。
     assert hint["cache_control"] == [
-        {"type": "pin", "range": {"end": 1, "unit": "message"}},
         {"type": "ephemeral", "ttl_s": 600, "range": {"end": 1, "unit": "message"}},
     ]
 

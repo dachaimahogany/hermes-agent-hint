@@ -101,6 +101,7 @@ def _on_post_tool_call(**kw):
     sid = _sid(kw)
     if not sid:
         return
+    _stats.note_tool_done(sid)  # prediction：结算工具耗时，供 TTL 估计
     since = _state.tool_finished(sid, str(kw.get("tool_call_id") or ""))
     if since is not None:  # 集合清空 -> 回 running（R3）
         _sink.emit(_builder.status_event(sid, "running", since_ms=since))

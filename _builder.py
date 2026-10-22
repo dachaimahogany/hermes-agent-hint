@@ -6,6 +6,13 @@
 - strict_priority 明确不写：由可信控制面注入，普通 Agent 永不主动设置（N1）。
 """
 
+# 引擎按块（128 token）缓存并整块哈希：不足一个块的前缀根本不会被存下来，
+# 为它声明保留等于要求引擎保留一个不存在的东西。
+MIN_CACHEABLE_PREFIX_TOKENS = 128
+
+_CJK_RANGES = ((0x2E80, 0x9FFF), (0xF900, 0xFAFF), (0xFF00, 0xFFEF))
+_CHARS_PER_TOKEN = 4
+
 
 def request_hint(session_id, call_index, epoch, agent_type, state, state_since_ms,
                  parent_session_id=None, derivation=None,
@@ -32,6 +39,65 @@ def request_hint(session_id, call_index, epoch, agent_type, state, state_since_m
     if prediction:
         hint["prediction"] = prediction
     return hint
+
+
+def _estimate_tokens(value):
+    """估算消息的 token 数（无 tokenizer）。
+
+    CJK 按字计 1 token（所服务的 tokenizer 大致如此），其余按 4 字符 1 token。
+    只用于判断前缀能否占满一个块，绝不用于推导 TTL。
+    """
+    if isinstance(value, str):
+        cjk = other = 0
+        for ch in value:
+            code = ord(ch)
+            if any(lo <= code <= hi for lo, hi in _CJK_RANGES):
+                cjk += 1
+            else:
+                other += 1
+        return cjk + -(-other // _CHARS_PER_TOKEN)
+    if isinstance(value, (list, tuple)):
+        return sum(_estimate_tokens(item) for item in value)
+    if isinstance(value, dict):
+        return sum(_estimate_tokens(item) for item in value.values())
+    return 0
+
+
+def cache_control(request, end=1, ttl_s=0, task_end=None):
+    """会话前缀的保留声明：**单一断点 + 显式 TTL**。
+
+    只有一条断点，`pin` 已退役：
+    - 消费侧从不区分 ``type``（只记日志），而 ``pin`` 这个名字暗示一个硬保证，
+      没有任何一层能兑现；Dynamo 已移除等价字段，vLLM RFC 也已放弃 Pin。
+    - 第二条断点在消费侧被折叠成"最宽 end + 最长显式 TTL"，不产生额外行为，
+      只会多占 header 预算。
+
+    断点位置：``task_end`` 合法且比 ``end`` 更宽时取它（保护到任务说明末尾），
+    否则取 ``end``（稳定前缀末尾）。当前轮对话永远不打断点。
+
+    ``ttl_s <= 0`` 时不产出任何条目——没有 TTL 就没有可声明的保留。
+    前缀不足一个块（``MIN_CACHEABLE_PREFIX_TOKENS``）时同样不产出。
+    ``request`` 含合法 messages 才产出，否则 None（畸形输入绝不抛错）。
+    """
+    messages = request.get("messages") if isinstance(request, dict) else None
+    if not isinstance(messages, list) or not messages or end <= 0:
+        return None
+    if end > len(messages):
+        # 断点越界：消费侧会整条丢弃 range，这里宁可不发也不发一个错位的声明。
+        return None
+    if ttl_s <= 0:
+        return None
+    if _estimate_tokens(messages) < MIN_CACHEABLE_PREFIX_TOKENS:
+        return None
+
+    target = end
+    if isinstance(task_end, int) and end < task_end <= len(messages):
+        target = task_end
+    return [{
+        "type": "ephemeral",
+        "ttl_s": ttl_s,
+        "range": {"end": target, "unit": "message"},
+    }]
 
 
 def status_event(session_id, state, since_ms, reason=None, tools=None):
@@ -73,37 +139,3 @@ def estimate_ttl_s(tool_expected_duration_s=None, interval_ms=None):
 
     raw = gap * TTL_SAFETY_FACTOR
     return max(TTL_MIN_S, min(TTL_MAX_S, int(round(raw))))
-
-
-def cache_control(request, end=1, ttl_s=0, task_end=None):
-    """会话前缀的保留声明：**单一断点 + 显式 TTL**。
-
-    只有一条断点，`pin` 已退役：
-    - 消费侧从不区分 ``type``（只记日志），而 ``pin`` 这个名字暗示一个硬保证，
-      没有任何一层能兑现；Dynamo 已移除等价字段，vLLM RFC 也已放弃 Pin。
-    - 第二条断点在消费侧被折叠成"最宽 end + 最长显式 TTL"，不产生额外行为，
-      只会多占 header 预算。
-
-    断点位置：``task_end`` 合法且比 ``end`` 更宽时取它（保护到任务说明末尾），
-    否则取 ``end``（稳定前缀末尾）。当前轮对话永远不打断点。
-
-    ``ttl_s <= 0`` 时不产出任何条目——没有 TTL 就没有可声明的保留。
-    ``request`` 含合法 messages 才产出，否则 None（畸形输入绝不抛错）。
-    """
-    messages = request.get("messages") if isinstance(request, dict) else None
-    if not isinstance(messages, list) or not messages or end <= 0:
-        return None
-    if end > len(messages):
-        # 断点越界：消费侧会整条丢弃 range，这里宁可不发也不发一个错位的声明。
-        return None
-    if ttl_s <= 0:
-        return None
-
-    target = end
-    if isinstance(task_end, int) and end < task_end <= len(messages):
-        target = task_end
-    return [{
-        "type": "ephemeral",
-        "ttl_s": ttl_s,
-        "range": {"end": target, "unit": "message"},
-    }]

@@ -104,6 +104,9 @@ def test_status_event_reason_tools_optional(ah_plugin):
     assert e2["agent_status"]["tools"][0]["call_id"] == "c1"
 
 
+LONG_PREFIX = "lorem ipsum dolor sit amet " * 40  # ~1080 chars, 约 270 token，超过一个块
+
+
 def test_cache_control_requires_explicit_ttl(ah_plugin):
     b = ah_plugin._builder
     req = {"messages": [{"role": "system"}, {"role": "user"}]}
@@ -118,7 +121,7 @@ def test_cache_control_requires_explicit_ttl(ah_plugin):
 
 def test_cache_control_ephemeral_carries_ttl(ah_plugin):
     b = ah_plugin._builder
-    req = {"messages": [{"role": "system"}, {"role": "user"}, {"role": "assistant"}]}
+    req = {"messages": [{"role": "system"}, {"role": "user", "content": LONG_PREFIX}, {"role": "assistant"}]}
     controls = b.cache_control(req, end=1, ttl_s=120)
     assert controls == [
         {"type": "ephemeral", "ttl_s": 120, "range": {"end": 1, "unit": "message"}},
@@ -129,7 +132,7 @@ def test_cache_control_ephemeral_carries_ttl(ah_plugin):
 
 def test_cache_control_second_breakpoint_widens_the_ephemeral(ah_plugin):
     b = ah_plugin._builder
-    req = {"messages": [{"role": f"m{i}"} for i in range(6)]}
+    req = {"messages": [{"role": f"m{i}", "content": LONG_PREFIX} for i in range(6)]}
     controls = b.cache_control(req, end=2, ttl_s=300, task_end=5)
     assert controls == [{"type": "ephemeral", "ttl_s": 300, "range": {"end": 5, "unit": "message"}}]
     # task_end 不大于 end 时不加宽（等于只是重复声明）
@@ -382,7 +385,7 @@ def test_sink_never_raises(ah_plugin, monkeypatch):
 def test_middleware_injects_header_cow(ah_plugin, monkeypatch):
     monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
     ah_plugin._settings._reset()
-    req = {"model": "x", "messages": [{"role": "system"}, {"role": "user", "content": "hi"}]}
+    req = {"model": "x", "messages": [{"role": "system"}, {"role": "user", "content": LONG_PREFIX}]}
     result = ah_plugin._on_llm_request(request=req, session_id="s1", api_request_id="r1")
     assert result is not None
     assert result["request"] is not req  # COW

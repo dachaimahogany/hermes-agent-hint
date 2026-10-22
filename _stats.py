@@ -9,6 +9,7 @@ import time
 from collections import defaultdict, deque
 
 _MAX_SAMPLES = 16
+_MIN_TOOL_SAMPLES = 3
 
 _lock = threading.Lock()  # collect/note_tool 跑 worker 线程、snapshot 跑 agent-loop，需互斥（review A1）
 
@@ -173,7 +174,7 @@ def snapshot(sid, next_action_map=None):
                 observed = list(_tool_durations.get(next_name) or ())
             p90 = _p90(observed)
             # 有实测就发实测的 p90，样本不足才退回常数 5 秒（保守：宁可短，不虚构长保留）。
-            expected = max(1, int(round(p90))) if p90 is not None and len(observed) >= 3 else 5
+            expected = max(1, int(round(p90))) if p90 is not None and len(observed) >= _MIN_TOOL_SAMPLES else 5
             na["tools"] = [{"name": next_name, "expected_duration_s": expected}]
         pred["next_action"] = na
         if remaining is not None:

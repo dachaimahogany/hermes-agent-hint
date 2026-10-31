@@ -64,6 +64,12 @@ hermes plugins enable agent-hint
 #     enabled: ["agent-hint"]
 ```
 
+> **Installing does not turn it on.** Two switches must both be on, or the middleware returns
+> immediately and no header is sent:
+>
+> 1. the plugin is enabled (`plugins.enabled` / `hermes plugins enable agent-hint`),
+> 2. the plugin's own master switch is on: `settings.enabled: true`, or `AGENT_HINT_ENABLED=1`.
+
 ## Configure
 
 Settings live under `plugins.entries.agent-hint.settings` in `config.yaml`; every key can also be set
@@ -80,7 +86,9 @@ Every key is optional — the defaults are the safe defaults.
 | `status_url` | *(empty)* | Target URL for the `http` sink. Empty = no network traffic at all. |
 | `finalize_on` | `session_end` | When to emit `finalize`: `session_end` or `session_finalize`. |
 | `suspend_after_s` | `0` | Emit `suspend` if an approval stays pending this long. `0` disables. |
-| `cache_pin_end` | `1` | `cache_control.pin.range.end`; `0` omits the range. |
+| `cache_pin_end` | `1` | Breakpoint position (`range.end`) of the single `ephemeral` entry; `0` omits the range. Historical name, kept for config compatibility. |
+| `cache_ttl_s` | `auto` | Retention seconds for the ephemeral range. `auto` derives it from the observed gap (next tool budget, else the inter-call interval, else 300 s, doubled and clamped to 60–3600); `0` sends no declaration at all; a number fixes it. |
+| `cache_task_end` | `0` | Message index of the task-description end. When wider than `cache_pin_end` it becomes the position of the **single** breakpoint; the declaration itself stays one entry. `0` uses `cache_pin_end`. |
 | `next_action_map` | *(empty)* | Generic `prediction.next_action` heuristic (JSON). Empty = omit. |
 
 Example:
@@ -107,7 +115,7 @@ classes carried in the JSON:
 | `session` | `session_id`, `agent_type`, `call_index`, `epoch` | Identity + call counter; `epoch` increments when the context is rewritten. |
 | `agent_status` | `state` (`running` / `tool` / `pause` / `finalize`), `state_since_ms`, `reason` | Lifecycle, out-of-band from the request path. |
 | `priority` | `level`, `reason` | Soft priority hint; the engine decides. |
-| `cache_control` | `pin`, `range` | Cache-pinning hint for the session's prefix. |
+| `cache_control` | `ephemeral`, `ttl_s`, `range` | One retention declaration for the session's prefix (`pin` is accepted by consumers as a retired alias). |
 | `prediction` | `latency_ms`, `output_tokens`, `interval_ms`, `next_action`, `remaining_calls` | Statistics are measured; `next_action`/`remaining_calls` are **heuristics** and are omitted unless `next_action_map` is configured. |
 
 `strict_priority` is deliberately **not** emitted: a client-side plugin must not be able to claim a
@@ -225,6 +233,11 @@ hermes plugins enable agent-hint
 #     enabled: ["agent-hint"]
 ```
 
+> **装上不等于打开。** 两个开关必须同时为开，否则中间件直接返回、一个 header 都不会发：
+>
+> 1. 插件已启用（`plugins.enabled` / `hermes plugins enable agent-hint`）；
+> 2. 插件自己的总开关：`settings.enabled: true`，或环境变量 `AGENT_HINT_ENABLED=1`。
+
 ## 配置
 
 配置位于 `config.yaml` 的 `plugins.entries.agent-hint.settings`；每个键也可用 `AGENT_HINT_<KEY>`
@@ -240,7 +253,9 @@ hermes plugins enable agent-hint
 | `status_url` | *(空)* | `http` 通道的目标地址。留空 = 完全不产生网络流量。 |
 | `finalize_on` | `session_end` | 何时发射 `finalize`：`session_end` 或 `session_finalize`。 |
 | `suspend_after_s` | `0` | 审批挂起超过该秒数时发射 `suspend`；`0` 关闭。 |
-| `cache_pin_end` | `1` | `cache_control.pin.range.end`；`0` 则不带 range。 |
+| `cache_pin_end` | `1` | 单条 `ephemeral` 的断点位置（`range.end`）；`0` 则不带 range。历史命名，保留以兼容既有配置。 |
+| `cache_ttl_s` | `auto` | ephemeral 保留秒数。`auto` 按运行时信号推导（下一次工具预算 → 请求间隔 → 默认 300s，乘 2 后钳到 60–3600）；`0` 不再发送任何声明；填数字则固定。 |
+| `cache_task_end` | `0` | 任务说明末尾的消息下标。比 `cache_pin_end` 更宽时，它成为**唯一那条**断点的位置；声明本身仍只有一条。`0` 表示沿用 `cache_pin_end`。 |
 | `next_action_map` | *(空)* | 通用的 `prediction.next_action` 启发式（JSON）。留空 = 不发射。 |
 
 示例：
@@ -266,7 +281,7 @@ plugins:
 | `session` | `session_id`、`agent_type`、`call_index`、`epoch` | 身份 + 调用计数；上下文被重写时 `epoch` 递增。 |
 | `agent_status` | `state`（`running` / `tool` / `pause` / `finalize`）、`state_since_ms`、`reason` | 生命周期状态，走请求路径之外。 |
 | `priority` | `level`、`reason` | 软优先级提示；最终由引擎决定。 |
-| `cache_control` | `pin`、`range` | 针对会话前缀的缓存亲和提示。 |
+| `cache_control` | `ephemeral`、`ttl_s`、`range` | 针对会话前缀的一条保留声明（消费侧仍接受 `pin` 作为已退役别名）。 |
 | `prediction` | `latency_ms`、`output_tokens`、`interval_ms`、`next_action`、`remaining_calls` | 统计值为实测量；`next_action`/`remaining_calls` 属**启发式**，未配置 `next_action_map` 时不发射。 |
 
 `strict_priority` **有意不发射**：客户端插件不应有能力声明硬优先级，信任决策属于控制面。

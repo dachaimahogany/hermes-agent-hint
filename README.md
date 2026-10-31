@@ -52,7 +52,7 @@ carried a hint field.
 ## Install
 
 ```bash
-hermes plugins install liteboy-bit/hermes-agent-hint   # or: hermes plugins install <repo-url>
+hermes plugins install dachaimahogany/hermes-agent-hint   # or: hermes plugins install <repo-url>
 ```
 
 Or drop the directory into `$HERMES_HOME/plugins/agent-hint/` (per-profile) and enable it:
@@ -221,7 +221,7 @@ header 解码 0 失败，且没有任何一个请求体携带 hint 字段。
 ## 安装
 
 ```bash
-hermes plugins install liteboy-bit/hermes-agent-hint   # 或 hermes plugins install <仓库地址>
+hermes plugins install dachaimahogany/hermes-agent-hint   # 或 hermes plugins install <仓库地址>
 ```
 
 也可以直接把目录放进 `$HERMES_HOME/plugins/agent-hint/`（按 profile 生效）再启用：

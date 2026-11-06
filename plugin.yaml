@@ -1,5 +1,5 @@
 name: agent-hint
-version: "0.7.1"
+version: "0.8.0"
 author: dachaimahogany
 description: "Gives the inference engine a machine-readable view of the agent session behind each
   request: adds a standard X-Agent-Hint header (base64url JSON) to main LLM requests and can report

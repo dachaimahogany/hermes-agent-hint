@@ -31,6 +31,13 @@ def _new():
         "inflight": set(),
         "parent_session_id": None,
         "child_role": None,
+        # 放行边：下一条请求头要带一次 resume（STATE_DESIGN §4.3「只描述一条请求」）
+        "pending_resume": False,
+        "pending_resume_since": None,
+        # 终态是否已经随某条请求头发出去过；false = 下一条请求头带 finalize
+        "finalize_served": False,
+        # 上一次 note_call 的返回：同一次逻辑调用重试时原样复用，不二次消耗一次性边
+        "last_reply": None,
     }
 
 
@@ -97,32 +104,78 @@ def _touch(sid):
 def note_call(sid, api_request_id=""):
     """登记一次（可能重试的）LLM 请求。返回 (call_index, state, since_ms, epoch, resumed)。
 
-    - 同 api_request_id 重复 -> call_index 不涨（重试/回退不虚增，R2）。
-    - 若当前停在 finalize（上一 turn 已结束）-> 置 running 并 resumed=True（M4）。
+    两条一次性边（STATE_DESIGN §4.3 / §4.4），都靠「挂在下一条请求上」实现，因为
+    ``resume`` / ``finalize`` 描述的是**一次边**而不是一段持续状态：
+
+    - 放行（``mark_resume``）之后的第一条请求头带 ``resume``，其后回到 ``running``；
+    - 停在 ``finalize``（上一 turn 已结束）的第一条请求头带 ``finalize``，其后的请求
+      才算新一轮：回 ``running`` 且 ``resumed=True``（中间件据此补发 running 事件，M4）。
+
+    同 api_request_id 重试原样返回上一次的结论：call_index 不虚增（R2），也不把
+    一次性边二次消耗掉（否则重试会先吃掉 resume，真正的下一条请求看不到它）。
     """
     with _lock:
         s = _touch(sid)
+        if (api_request_id and api_request_id == s["last_api_request_id"]
+                and s["last_reply"] is not None):
+            return s["last_reply"]  # 同一逻辑调用的重试/回退：结论不变
         resumed = False
-        if s["state"] == "finalize":
-            s["state"] = "running"
-            s["state_since_ms"] = _now_ms()
-            resumed = True
+        state, since = s["state"], s["state_since_ms"]
+        if s["pending_resume"]:
+            # 放行边只描述紧跟着的那一条请求
+            s["pending_resume"] = False
+            state = "resume"
+            since = s["pending_resume_since"] or since
+            s["pending_resume_since"] = None
+        elif state == "finalize":
+            if not s["finalize_served"]:
+                s["finalize_served"] = True  # 本次请求携带 finalize
+            else:  # 终态已发出过一次：这条是新的一轮
+                s["state"] = "running"
+                s["state_since_ms"] = _now_ms()
+                state, since = s["state"], s["state_since_ms"]
+                resumed = True
         if api_request_id and api_request_id == s["last_api_request_id"]:
             pass  # 同一次逻辑调用重试，call_index 不涨
         else:
             s["call_index"] += 1
             s["last_api_request_id"] = api_request_id or ""
-        return (s["call_index"], s["state"], s["state_since_ms"], _current_epoch(sid, s), resumed)
+        reply = (s["call_index"], state, since, _current_epoch(sid, s), resumed)
+        s["last_reply"] = reply
+        return reply
 
 
 def set_state(sid, state):
-    """状态切换；仅变化时更新 state_since_ms。返回当前 state_since_ms。"""
+    """状态切换；仅变化时更新 state_since_ms。返回当前 state_since_ms。
+
+    进入 ``pause`` / ``finalize`` 会作废尚未被请求消费的放行边——新一轮挂起或结束
+    覆盖上一轮的「刚放行」。任何一次切换都重置 ``finalize_served``：终态可以随下一条
+    请求头再发一次。
+    """
     with _lock:
         s = _touch(sid)
         if s["state"] != state:
             s["state"] = state
             s["state_since_ms"] = _now_ms()
+        if state in ("pause", "finalize"):
+            s["pending_resume"] = False
+            s["pending_resume_since"] = None
+        s["finalize_served"] = False
         return s["state_since_ms"]
+
+
+def mark_resume(sid, since_ms=None):
+    """审批/挂起放行：标记**下一条**请求头带一次 ``resume``，其后回 ``running``。
+
+    ``resume`` 携带的是"刚刚被放行"这个一次性事件，不能作为持续状态挂在会话上，
+    否则后面每条请求都会报 resume。返回该边的进入时刻（放行时刻），它同时就是
+    那条请求头里的 ``state_since_ms``——消费侧据此知道上下文从哪一刻起值得保留。
+    """
+    with _lock:
+        s = _touch(sid)
+        s["pending_resume"] = True
+        s["pending_resume_since"] = int(since_ms) if since_ms else _now_ms()
+        return s["pending_resume_since"]
 
 
 def tool_started(sid, call_id):

@@ -13,6 +13,29 @@ MIN_CACHEABLE_PREFIX_TOKENS = 128
 _CJK_RANGES = ((0x2E80, 0x9FFF), (0xF900, 0xFAFF), (0xFF00, 0xFFEF))
 _CHARS_PER_TOKEN = 4
 
+# 请求头只认四值。内部状态词（tool / suspend / timeout / checkpoint）是排障细节，
+# 一到线缆就必须折叠（AGENT_STATUS_STATE_DESIGN §2.3）：tool 类折成 running
+# （"在跑工具"和"在干活"对调度没区别），等得久折成 pause（等工具超时和等人，
+# 消费侧是同一件事）。带外事件比请求头多一个 tool，但 suspend 同样禁止上线路。
+HEADER_STATES = ("running", "pause", "resume", "finalize")
+_TOOL_LIKE = ("tool", "tool_call", "executing_tool")
+_HEADER_FOLD = {"tool": "running", "tool_call": "running", "executing_tool": "running",
+                "suspend": "pause", "timeout": "pause", "checkpoint": "pause"}
+
+
+def header_state(state):
+    """内部状态 -> 请求头线缆值（四值）。未知词按 running 兜底，绝不发非法值。"""
+    if state in HEADER_STATES:
+        return state
+    return _HEADER_FOLD.get(str(state), "running")
+
+
+def event_state(state):
+    """内部状态 -> 带外事件词表：比请求头多一个 tool，suspend 一律折成 pause。"""
+    if state in _TOOL_LIKE:
+        return "tool"
+    return _HEADER_FOLD.get(str(state), header_state(state))
+
 
 def request_hint(session_id, call_index, epoch, agent_type, state, state_since_ms,
                  parent_session_id=None, derivation=None,
@@ -30,7 +53,8 @@ def request_hint(session_id, call_index, epoch, agent_type, state, state_since_m
         session["derivation"] = derivation
     hint = {
         "session": session,
-        "agent_status": {"state": state, "state_since_ms": state_since_ms},
+        "agent_status": {"state": header_state(state),
+                         "state_since_ms": state_since_ms},
     }
     if priority:
         hint["priority"] = priority
@@ -104,7 +128,7 @@ def status_event(session_id, state, since_ms, reason=None, tools=None):
     """构造状态事件（异步上报）。session 只带 session_id（对齐字段文档 §4 示例）。"""
     event = {
         "session": {"session_id": session_id},
-        "agent_status": {"state": state, "state_since_ms": since_ms},
+        "agent_status": {"state": event_state(state), "state_since_ms": since_ms},
     }
     if reason:
         event["agent_status"]["reason"] = reason

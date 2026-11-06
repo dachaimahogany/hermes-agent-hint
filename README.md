@@ -113,10 +113,17 @@ classes carried in the JSON:
 | Class | Fields | Notes |
 |---|---|---|
 | `session` | `session_id`, `agent_type`, `call_index`, `epoch` | Identity + call counter; `epoch` increments when the context is rewritten. |
-| `agent_status` | `state` (`running` / `tool` / `pause` / `finalize`), `state_since_ms`, `reason` | Lifecycle, out-of-band from the request path. |
+| `agent_status` | `state` (`running` / `pause` / `resume` / `finalize`), `state_since_ms` | Lifecycle. The header carries the four-value vocabulary only; `resume` / `finalize` are **one-shot edges** that describe exactly one request. `reason` / `tools` ride the event channel. |
 | `priority` | `level`, `reason` | Soft priority hint; the engine decides. |
 | `cache_control` | `ephemeral`, `ttl_s`, `range` | One retention declaration for the session's prefix (`pin` is accepted by consumers as a retired alias). |
 | `prediction` | `latency_ms`, `output_tokens`, `interval_ms`, `next_action`, `remaining_calls` | Statistics are measured; `next_action`/`remaining_calls` are **heuristics** and are omitted unless `next_action_map` is configured. |
+
+The four wire states are ordered edges, not a level: `pause` stays sticky for as long as somebody is
+waiting (approval, clarification, suspend), `resume` describes **only the first request after the
+release**, `finalize` describes **only the first request after the session ended** (if the host sends
+another request afterwards it is back to `running`). Internal words never reach the wire: `tool` folds
+to `running` in the header and survives only on the event channel; `suspend` / `timeout` / `checkpoint`
+fold to `pause` on both channels (the reason travels in `agent_status.reason`).
 
 `strict_priority` is deliberately **not** emitted: a client-side plugin must not be able to claim a
 hard priority. Trust decisions belong to the control plane.
@@ -279,7 +286,7 @@ plugins:
 | 类别 | 字段 | 说明 |
 |---|---|---|
 | `session` | `session_id`、`agent_type`、`call_index`、`epoch` | 身份 + 调用计数；上下文被重写时 `epoch` 递增。 |
-| `agent_status` | `state`（`running` / `tool` / `pause` / `finalize`）、`state_since_ms`、`reason` | 生命周期状态，走请求路径之外。 |
+| `agent_status` | `state`（`running` / `pause` / `resume` / `finalize`）、`state_since_ms` | 生命周期。请求头只发四值；`resume` / `finalize` 是**一次性边**，只描述紧接的那一条请求。`reason` / `tools` 走事件通道。 |
 | `priority` | `level`、`reason` | 软优先级提示；最终由引擎决定。 |
 | `cache_control` | `ephemeral`、`ttl_s`、`range` | 针对会话前缀的一条保留声明（消费侧仍接受 `pin` 作为已退役别名）。 |
 | `prediction` | `latency_ms`、`output_tokens`、`interval_ms`、`next_action`、`remaining_calls` | 统计值为实测量；`next_action`/`remaining_calls` 属**启发式**，未配置 `next_action_map` 时不发射。 |
@@ -311,7 +318,7 @@ hook 载荷按关键字防御式读取；若某 hook 的载荷结构变化，会
 ## 测试
 
 ```bash
-python3 -m pytest tests/     # 36 个用例，无网络，无需安装 Hermes
+python3 -m pytest tests/     # 48 个用例，无网络，无需安装 Hermes
 ```
 
 ## 验证
@@ -330,6 +337,22 @@ python3 -m pytest tests/     # 36 个用例，无网络，无需安装 Hermes
    `prio=None aff=-`。
 3. **benchmark + 真机验证** —— 前缀缓存冷暖对照、hint 关/开的路由对照、以及 9 条真实 agent 请求抓取，
    数字见[报告](docs/benchmark-report.zh-CN.md)。
+
+## 变更记录
+
+- **0.8.0** —— 状态语义对齐四值契约（`AGENT_STATUS_STATE_DESIGN.md` §2.3 / §4.3 / §4.4）：
+  - 审批放行后，**下一条**请求头带一次 `resume`（`_state.mark_resume()`），其后回 `running`。
+    此前放行只发事件、请求头直接回 `running`，消费侧永远看不到「刚被放行」这个边。
+  - 会话结束后，**下一条**请求头带一次 `finalize`；再来的请求才算新一轮（`running` +
+    补发 running 事件）。此前 `note_call()` 一进来就把 `finalize` 翻成 `running`，终态
+    从未上过头。
+  - 同 `api_request_id` 的重试原样复用上一次结论：`call_index` 不虚增，也不会把一次性边
+    二次消耗掉。
+  - 内部状态词不再泄漏到线缆：请求头 `tool → running`、`suspend/timeout/checkpoint → pause`；
+    事件通道保留 `tool`，但 `suspend` 同样折成 `pause`（原先审批等超时会发 `suspend` 事件，
+    那是消费侧不认识的词）。
+  - 单测 36 → 48：新增四条一次性边用例（resume 只发一条 / finalize 先发后回 running /
+    重试不消耗边 / 新挂起覆盖旧放行）与线缆折叠用例，外加一条走真实 hooks 的端到端断言。
 
 ## 许可
 

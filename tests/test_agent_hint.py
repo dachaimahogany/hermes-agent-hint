@@ -206,12 +206,64 @@ def test_state_since_ms_updates_on_change_only(ah_plugin):
     assert third >= first  # 变化则更新时间戳
 
 
-def test_finalize_then_resume(ah_plugin):
+def test_finalize_rides_one_request_then_back_to_running(ah_plugin):
+    """§4.4：跑完还有下一条请求时，那条请求头带 finalize，其后的请求才回 running。"""
     s = ah_plugin._state
-    s.set_state("s1", "finalize")
-    _ci, state, _since, _epoch, resumed = s.note_call("s1", "r9")
-    assert resumed is True
-    assert state == "running"
+    since = s.set_state("s1", "finalize")
+    _ci, state, got_since, _epoch, resumed = s.note_call("s1", "r9")
+    assert state == "finalize" and got_since == since and resumed is False
+    _ci, state, _since, _epoch, resumed = s.note_call("s1", "r10")
+    assert state == "running" and resumed is True  # 新一轮：中间件据此补发 running 事件
+
+
+def test_resume_rides_exactly_one_request(ah_plugin):
+    """§4.3：resume 只描述紧跟放行的那一条请求，其后立刻回 running。"""
+    s = ah_plugin._state
+    s.set_state("s1", "pause")
+    s.set_state("s1", "running")
+    released_at = s.mark_resume("s1")
+    _ci, state, since, _epoch, resumed = s.note_call("s1", "r1")
+    assert state == "resume"
+    assert since == released_at  # state_since_ms = 放行时刻，不是请求时刻
+    assert resumed is False
+    assert s.note_call("s1", "r2")[1] == "running"
+
+
+def test_retry_does_not_consume_one_shot(ah_plugin):
+    """同一 api_request_id 重试：结论原样返回，不二次消耗 resume 边。"""
+    s = ah_plugin._state
+    s.mark_resume("s1")
+    first = s.note_call("s1", "r1")
+    assert first[1] == "resume"
+    assert s.note_call("s1", "r1") == first
+    assert s.note_call("s1", "r2")[1] == "running"
+
+
+def test_new_pause_cancels_pending_resume(ah_plugin):
+    """上一轮的放行边还没被请求消费就再次挂起：新挂起覆盖旧放行。"""
+    s = ah_plugin._state
+    s.mark_resume("s1")
+    s.set_state("s1", "pause")
+    assert s.note_call("s1", "r1")[1] == "pause"
+
+
+def test_header_state_folds_internal_words(ah_plugin):
+    """§2.3 折叠：请求头只发四值，tool 折 running、suspend 折 pause；事件保留 tool。"""
+    b = ah_plugin._builder
+    assert b.header_state("running") == "running"
+    assert b.header_state("resume") == "resume"
+    assert b.header_state("tool") == "running"
+    assert b.header_state("suspend") == "pause"
+    assert b.header_state("checkpoint") == "pause"
+    assert b.header_state("不认识的词") == "running"
+    assert b.event_state("tool") == "tool"
+    assert b.event_state("suspend") == "pause"
+    hint = b.request_hint(session_id="s1", call_index=1, epoch=0, agent_type="t",
+                          state="tool", state_since_ms=1)
+    assert hint["agent_status"]["state"] == "running"
+    assert b.status_event("s1", "suspend", since_ms=1,
+                          reason="checkpoint")["agent_status"]["state"] == "pause"
+    assert b.status_event("s1", "tool", since_ms=1)["agent_status"]["state"] == "tool"
 
 
 def test_subagent_map_and_cleanup(ah_plugin):
@@ -399,6 +451,30 @@ def test_middleware_injects_header_cow(ah_plugin, monkeypatch):
         # 断点默认 auto：落在当前逻辑输入末尾（system + user = 2），不再只护 system 那条
         {"type": "ephemeral", "ttl_s": 600, "range": {"end": 2, "unit": "message"}},
     ]
+
+
+def test_middleware_header_follows_release_and_session_end(ah_plugin, monkeypatch):
+    """走真实 hooks：放行后第一条请求头 resume，会话结束后第一条请求头 finalize。"""
+    monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
+    ah_plugin._settings._reset()
+    req = {"model": "x", "messages": [{"role": "system"}, {"role": "user", "content": LONG_PREFIX}]}
+
+    def _state_of(api_request_id):
+        out = ah_plugin._on_llm_request(request=dict(req), session_id="s1",
+                                        api_request_id=api_request_id)
+        hint = ah_plugin._codec.decode(out["request"]["extra_headers"]["X-Agent-Hint"])
+        return hint["agent_status"]["state"]
+
+    ah_plugin._on_session_start(session_id="s1")
+    assert _state_of("r1") == "running"
+    ah_plugin._on_pre_approval_request(session_id="s1", session_key="s1")
+    assert _state_of("r2") == "pause"
+    ah_plugin._on_post_approval_response(session_id="s1", session_key="s1")
+    assert _state_of("r3") == "resume"      # 紧跟放行的那一条
+    assert _state_of("r4") == "running"     # 其后回默认
+    ah_plugin._on_session_end(session_id="s1", completed=True)
+    assert _state_of("r5") == "finalize"    # 结束之后还有请求 -> 那条带 finalize
+    assert _state_of("r6") == "running"     # 新一轮
 
 
 def test_middleware_request_not_dict(ah_plugin, monkeypatch):

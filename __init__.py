@@ -126,6 +126,9 @@ def _on_post_approval_response(**kw):
         return
     _state.cancel_suspend_watchdog(sid)
     since = _state.set_state(sid, "running")
+    # 事件通道报 running（人已放行，回到干活）；请求头则要在**下一条**请求上带一次
+    # resume：resume 描述的是一次性放行边，挂在会话状态上会让后面每条请求都报它。
+    _state.mark_resume(sid, since_ms=since)
     _sink.emit(_builder.status_event(sid, "running", since_ms=since))
 
 

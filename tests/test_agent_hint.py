@@ -813,3 +813,43 @@ def test_epoch_bumps_when_the_context_shrinks(ah_plugin, monkeypatch):
     assert emitted_epoch("r-2") == 1   # 压缩一次
     ah_plugin._state.bump_epoch("s-epoch")
     assert emitted_epoch("r-3") == 2   # 再压缩一次
+def test_approval_release_emits_one_resume_event(ah_plugin, monkeypatch):
+    """事件通道与请求头同一套四值：放行的一次性边在事件里也只报一条 resume。
+
+    2026-11-07 规格裁定：事件词表含 resume（不再折成 running）；同一条边只报一次，
+    且 state_since_ms 与请求头同一时刻。
+    """
+    monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
+    ah_plugin._settings._reset()
+    events = []
+    monkeypatch.setattr(ah_plugin._sink, "emit", lambda e: events.append(e))
+
+    mw = {}
+    class _C:
+        def register_hook(self, name, cb):
+            pass
+
+        def register_middleware(self, name, cb):
+            mw[name] = cb
+
+    ah_plugin.register(_C())
+    ah_plugin._on_pre_approval_request(session_id="s-edge", kind="approval")
+    ah_plugin._on_post_approval_response(session_id="s-edge", choice="once")
+
+    states = [e.get("agent_status", {}).get("state") for e in events]
+    assert states == ["pause", "resume"], states
+    resume_event = events[-1]["agent_status"]
+
+    req = {"model": "m", "messages": [
+        {"role": "system", "content": "sys " + "x " * 400},
+        {"role": "user", "content": "hi"}]}
+    out = mw["llm_request"](request=req, session_id="s-edge", api_request_id="r-edge-1")
+    hint = ah_plugin._codec.decode(out["request"]["extra_headers"]["X-Agent-Hint"])
+    assert hint["agent_status"]["state"] == "resume"
+    assert hint["agent_status"]["state_since_ms"] == resume_event["state_since_ms"]
+
+    out2 = mw["llm_request"](request=req, session_id="s-edge", api_request_id="r-edge-2")
+    hint2 = ah_plugin._codec.decode(out2["request"]["extra_headers"]["X-Agent-Hint"])
+    assert hint2["agent_status"]["state"] == "running"
+    # 边只发一次：第二条请求之后事件通道不会再补一条 resume。
+    assert [e.get("agent_status", {}).get("state") for e in events] == ["pause", "resume"]

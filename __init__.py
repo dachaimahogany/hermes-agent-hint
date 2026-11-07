@@ -127,10 +127,10 @@ def _on_post_approval_response(**kw):
         return
     _state.cancel_suspend_watchdog(sid)
     since = _state.set_state(sid, "running")
-    # 事件通道报 running（人已放行，回到干活）；请求头则要在**下一条**请求上带一次
-    # resume：resume 描述的是一次性放行边，挂在会话状态上会让后面每条请求都报它。
+    # 放行是一次性边：事件通道与请求头同一套四值，两边都只报一次 resume（同一时刻），
+    # 之后再出现的状态是 running。挂在会话状态上会让后面每条请求都报它，所以边只走一次。
     _state.mark_resume(sid, since_ms=since)
-    _sink.emit(_builder.status_event(sid, "running", since_ms=since))
+    _sink.emit(_builder.status_event(sid, "resume", since_ms=since, reason="human_approval"))
 
 
 def _on_subagent_start(**kw):

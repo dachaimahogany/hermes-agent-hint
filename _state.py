@@ -230,12 +230,26 @@ def agent_type(sid, default):
 
 
 def lineage(sid):
-    """返回 (parent_session_id, derivation)；根会话 -> (None, None)。"""
+    """返回 (parent_session_id, derivation)。
+
+    优先级：原生 ``subagent_start`` 记录（spawn）> 部署方声明（fork 或 spawn）> 根会话 (None, None)。
+    Hermes 没有 fork 事件，所以一条 fork 血缘只能由创建该会话的一方声明出来。
+    """
     with _lock:
         entry = _subagent.get(sid)
-        if not entry or not entry[0]:
-            return (None, None)
-        return (entry[0], {"relation": "spawn", "join": "sync"})
+        if entry and entry[0]:
+            return (entry[0], {"relation": "spawn", "join": "sync"})
+    from . import _settings  # 局部导入：_settings 不依赖本模块，避免加载期循环
+    declared = _settings.lineage()
+    if not declared:
+        return (None, None)
+    derivation = {"relation": declared["relation"]}
+    if declared["relation"] == "spawn":
+        derivation["join"] = "sync"
+    elif declared["relation"] == "fork":
+        if declared.get("fork_point") is not None:
+            derivation["fork_point"] = declared["fork_point"]
+    return (declared.get("parent_session_id"), derivation)
 
 
 def subagent_start(parent_session_id, child_session_id, child_role):

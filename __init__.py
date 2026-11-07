@@ -74,6 +74,7 @@ def _on_session_finalize(**kw):
     if not sid:
         return
     if _settings.finalize_on() == "session_finalize":
+        # 会话级模式：finalize 是会话级终态，一个会话至多一次，且必须是它的最后一条事件。
         since = _state.set_state(sid, "finalize")
         _sink.emit(_builder.status_event(sid, "finalize", since_ms=since))
     _state.drop(sid)  # 会话真关闭回收（接缝）
@@ -156,11 +157,30 @@ def _on_post_api_request(**kw):
 
 # --- middleware ---
 
+_AUX_PURPOSES = ("compaction", "summarization", "summary", "title")
+
+
+def _is_aux_request(kw):
+    """辅助请求判定（RFC §1.3 / §3.3.5）：压缩摘要、会话标题这类请求不带任何 hint。
+
+    Hermes 宿主没有独立的 compaction 事件（issue #118382），所以辅助性只能由
+    中间件调用点显式声明：``auxiliary=1``，或 ``purpose`` 属辅助类。声明责任在
+    宿主/适配器一侧，插件不做消息条数猜测——猜错的代价（主请求裸奔）远大于
+    漏判（辅助请求多带一个头）。
+    """
+    if kw.get("auxiliary"):
+        return True
+    return str(kw.get("purpose") or "").strip().lower() in _AUX_PURPOSES
+
+
 def _on_llm_request(**kw):
     if not _on():
         return None
     req = kw.get("request")
     if not isinstance(req, dict):
+        return None
+    if _is_aux_request(kw):
+        # 辅助请求豁免：原样放行，不带 hint、不推进 call_index（RFC §1.3/§3.3.5）。
         return None
     sid = _sid(kw)
     if not sid:
@@ -202,6 +222,8 @@ def _on_llm_request(**kw):
         headers = dict(req.get("extra_headers") or {})
         headers["X-Agent-Hint"] = _codec.encode(hint)
         req["extra_headers"] = headers
+        # resume / finalize 都是一次性边：note_call 已经在状态机里把边消费掉
+        # （pending_resume 清零、finalize_served 置位），不需要在这里再翻状态。
         return {"request": req}
     except Exception as e:
         _sink._warn_once("llm_request", "hint build failed (kept request as-is): " + str(e))

@@ -338,6 +338,20 @@ python3 -m pytest tests/     # 48 个用例，无网络，无需安装 Hermes
 
 ## 变更记录
 
+- **0.9.0** —— 0.8.0 之后的三处修正（RFC §1.3 / §3.3.5 / §3.4，以及四值事件词表）：
+  - **辅助请求整段豁免**：`auxiliary=1` 或 `purpose` 属 `{compaction, summarization, summary, title}`
+    的请求不发 hint，也不推进 `call_index`。此前压缩/摘要请求同样带 header，消费侧会把
+    「为压缩服务的请求」当成主线请求统计。
+  - **`priority.reason` 折叠进 RFC 词表** `{user_waiting, critical_path, background}`：
+    宿主自造的 `continuation: tool_followup` 一类先按冒号前缀取词表内前缀，词表外再按档位
+    兜底（免排队档 `user_waiting`、背景档 `background`），不再把原样词发上线缆。
+  - **事件通道补发 `resume`**：`post_approval_response` 现在报 `resume`（原先折成 `running`），
+    与请求头同一时刻、同一 `state_since_ms`，且只报一次 —— 事件词表四值
+    （`running` / `pause` / `resume` / `finalize`）在事件通道与请求头两条通道上同表。
+  - 另：`AGENT_HINT_LINEAGE` 供部署方声明 fork 血缘（Hermes 原生只有 spawn）；
+    会话级 finalize 模式并入 `finalize_on`（默认仍是 `session_end`）。
+  - 单测 48 → 66：新增 `tests/test_field_sending.py`（逐字段走真实注册 + 真实中间件）
+    与「放行只报一条 `resume` 事件、且与请求头 `state_since_ms` 一致」用例。
 - **0.8.0** —— 状态语义对齐四值契约（`AGENT_STATUS_STATE_DESIGN.md` §2.3 / §4.3 / §4.4）：
   - 审批放行后，**下一条**请求头带一次 `resume`（`_state.mark_resume()`），其后回 `running`。
     此前放行只发事件、请求头直接回 `running`，消费侧永远看不到「刚被放行」这个边。

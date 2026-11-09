@@ -1,5 +1,5 @@
 name: agent-hint
-version: "0.9.0"
+version: "0.10.0"
 author: dachaimahogany
 description: "Gives the inference engine a machine-readable view of the agent session behind each
   request: adds a standard X-Agent-Hint header (base64url JSON) to main LLM requests and can report
@@ -20,6 +20,7 @@ provides_hooks:
   - subagent_start
   - subagent_stop
   - post_api_request
+  - post_compaction
 provides_middleware:
   - llm_request
 
@@ -60,7 +61,13 @@ config_schema:
     required: false
     description: "Emit a suspend event once an approval has been pending this many seconds
       (integer; 0 = disabled). Default: 0."
-  cache_pin_end:
+  epoch_on:
+    type: str
+    required: false
+    description: "Which post_compaction kinds count as a context rewrite and bump session.epoch:
+      comma list over the host's closed set (summarize, micro_summarize, prune_tool_results,
+      provider_native), or all / none. Default: summarize,micro_summarize,provider_native
+      (prune_tool_results only trims tool results and leaves the message count unchanged)."  cache_pin_end:
     required: false
     description: "Breakpoint position (range.end) of the single ephemeral declaration.
       auto (default) = end of the current logical input, system prompt included;

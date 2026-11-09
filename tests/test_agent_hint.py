@@ -625,7 +625,7 @@ def test_epoch_counter_and_provider_seam(ah_plugin):
     assert s.note_call("s1", "r4")[3] == 1
     s.set_epoch_provider(None)                    # 恢复内部计数器
     assert s.note_call("s1", "r5")[3] == 1
-    assert s.bump_epoch("s-nonexistent") == 0     # 未知会话安全返回 0
+    assert s.bump_epoch("s-nonexistent") == 1     # 0.10.0 起未知会话也抬代（压缩可能早于首条请求）
 
 
 def test_priority_folds_onto_the_two_level_contract(ah_plugin, monkeypatch):
@@ -853,3 +853,56 @@ def test_approval_release_emits_one_resume_event(ah_plugin, monkeypatch):
     assert hint2["agent_status"]["state"] == "running"
     # 边只发一次：第二条请求之后事件通道不会再补一条 resume。
     assert [e.get("agent_status", {}).get("state") for e in events] == ["pause", "resume"]
+
+# ---------------- post_compaction（0.10.0：epoch 当真信号使） ----------------
+
+def _enable(ah_plugin, monkeypatch, **env):
+    """打开插件并写入任意 AGENT_HINT_<KEY> 覆盖（settings 快照随后重载）。"""
+    monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
+    for key, val in env.items():
+        monkeypatch.setenv("AGENT_HINT_" + key.upper(), val)
+    ah_plugin._settings._reset()
+
+
+def test_post_compaction_bumps_epoch_on_rewrite(ah_plugin, monkeypatch):
+    """宿主报一次已提交压缩（kind=summarize），会话 epoch 换代——不再需要外部接缝来推。"""
+    _enable(ah_plugin, monkeypatch)
+    assert ah_plugin._state.note_call("s1")[3] == 0
+    ah_plugin._on_post_compaction(session_id="s1", old_session_id="", kind="summarize",
+                                  reason="auto", before_tokens=9000, after_tokens=1200,
+                                  messages_removed=7)
+    assert ah_plugin._state.note_call("s1")[3] == 1, "epoch must advance right after the host reports a rewrite"
+    # 返回值被宿主忽略，但契约上必须是 None（纯观察，不参与决策）
+    assert ah_plugin._on_post_compaction(session_id="s1", kind="provider_native") is None
+    assert ah_plugin._state.note_call("s1")[3] == 2
+
+
+def test_post_compaction_bumps_unseen_session(ah_plugin, monkeypatch):
+    """压缩可能发生在第一条请求之前：这时也要抬代，否则 note_call 建状态时那代会丢。"""
+    _enable(ah_plugin, monkeypatch)
+    ah_plugin._on_post_compaction(session_id="s-fresh", kind="micro_summarize")
+    assert ah_plugin._state.note_call("s-fresh")[3] == 1
+
+
+def test_post_compaction_kind_gate(ah_plugin, monkeypatch):
+    """prune_tool_results 默认不算上下文重写；epoch_on=all 时才抬代；none 时一律不抬。"""
+    _enable(ah_plugin, monkeypatch)
+    ah_plugin._state.note_call("s2")
+    ah_plugin._on_post_compaction(session_id="s2", kind="prune_tool_results")
+    assert ah_plugin._state.note_call("s2")[3] == 0, "trimming tool results leaves the message count unchanged"
+
+    _enable(ah_plugin, monkeypatch, epoch_on="all")
+    ah_plugin._on_post_compaction(session_id="s2", kind="prune_tool_results")
+    assert ah_plugin._state.note_call("s2")[3] == 1
+
+    _enable(ah_plugin, monkeypatch, epoch_on="none")
+    ah_plugin._on_post_compaction(session_id="s2", kind="summarize")
+    assert ah_plugin._state.note_call("s2")[3] == 1, "epoch_on=none turns the hook into a pure observer"
+
+
+def test_post_compaction_disabled_is_noop(ah_plugin, monkeypatch):
+    """关闭态（默认）下钩子不建状态、不抬代。"""
+    monkeypatch.setenv("AGENT_HINT_ENABLED", "0")
+    ah_plugin._settings._reset()
+    ah_plugin._on_post_compaction(session_id="s3", kind="summarize")
+    assert ah_plugin._state.note_call("s3")[3] == 0

@@ -79,11 +79,14 @@ def set_epoch_provider(fn):
 
 
 def bump_epoch(sid):
-    """上下文重写/压缩-fork 时递增会话 epoch（零侵入触发暂缺，留接缝，T4）。返回新 epoch。"""
+    """上下文重写/压缩发生后递增会话 epoch。返回新 epoch。
+
+    0.10.0 起由 ``post_compaction`` 钩子驱动（宿主每次已提交压缩回调一次）；
+    ``set_epoch_provider`` 仍是可插的旁路。未见过的会话也要能抬代：压缩可能发生在
+    第一条请求之前，若这里只查不建，那条 epoch 变化会在 ``note_call`` 建状态时丢掉。
+    """
     with _lock:
-        s = _sessions.get(sid)
-        if s is None:
-            return 0
+        s = _touch(sid)
         s["epoch"] += 1
         return s["epoch"]
 

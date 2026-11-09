@@ -338,7 +338,18 @@ python3 -m pytest tests/     # 48 个用例，无网络，无需安装 Hermes
 
 ## 变更记录
 
-- **0.9.0** —— 0.8.0 之后的三处修正（RFC §1.3 / §3.3.5 / §3.4，以及四值事件词表）：
+- **0.10.0** —— `session.epoch` 从「接缝构造」升级成「宿主真信号」：
+  - 注册宿主自 v0.21.6 起提供的 **`post_compaction`** 钩子（`hermes_cli/plugins.py:203`，
+    fire 点 `agent/compaction_events.py:239`）：自动/手动压缩、overflow 恢复、网关 `/compress`、
+    Codex app-server 压缩、微压缩、工具结果裁剪，**每次已提交压缩**回调一次，携带
+    `kind / reason / before_tokens / after_tokens / messages_removed`。
+  - epoch 换代口径落在「逻辑输入被重写」的 kind：默认 `summarize` / `micro_summarize` /
+    `provider_native`；`prune_tool_results` 只裁短工具结果、消息条数不变，默认**不**抬代。
+    `AGENT_HINT_EPOCH_ON` 可覆盖（逗号列表 / `all` / `none`）。
+  - `_state.bump_epoch()` 对未见过的会话也生效（压缩可能发生在首条请求之前）；`set_epoch_provider`
+    旁路保留。此前 epoch 只能由外部调接缝或注入 provider 推进，真机用户压缩后 epoch 恒 0。
+  - 单测 66 → 70（钩子驱动抬代、未见会话、kind 闸门、关闭态 no-op），既有用例的
+    「未知会话 `bump_epoch` 返回 0」断言随之更正为返回新 epoch。- **0.9.0** —— 0.8.0 之后的三处修正（RFC §1.3 / §3.3.5 / §3.4，以及四值事件词表）：
   - **辅助请求整段豁免**：`auxiliary=1` 或 `purpose` 属 `{compaction, summarization, summary, title}`
     的请求不发 hint，也不推进 `call_index`。此前压缩/摘要请求同样带 header，消费侧会把
     「为压缩服务的请求」当成主线请求统计。

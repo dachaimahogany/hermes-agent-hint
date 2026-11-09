@@ -1,4 +1,4 @@
-"""agent-hint 插件入口：注册 llm_request 中间件 + 10 个 hooks。
+"""agent-hint 插件入口：注册 llm_request 中间件 + 11 个 hooks。
 
 零侵入：只依赖 ctx（register_hook / register_middleware / get_config）与标准库，
 不 import 任何 hermes 内部模块。关闭态（enabled=0，默认）中间件与 hooks 均在入口早退（us 级）。
@@ -20,6 +20,7 @@ def register(ctx):
         ("subagent_start", _on_subagent_start),
         ("subagent_stop", _on_subagent_stop),
         ("post_api_request", _on_post_api_request),
+        ("post_compaction", _on_post_compaction),
     ):
         ctx.register_hook(name, cb)
 
@@ -153,6 +154,35 @@ def _on_post_api_request(**kw):
     if not _on():
         return
     _stats.collect(**kw)
+
+
+# 宿主的压缩 kind 闭合集（agent/compaction_events.py:33）；epoch 换代口径见 _settings.epoch_on
+def _on_post_compaction(**kw):
+    """每次**已提交**压缩之后回调一次（hermes ≥0.21.6：plugins.py 的 post_compaction，
+    fire 点 agent/compaction_events.py:239），覆盖自动/手动压缩、overflow 恢复、
+    网关 /compress、Codex app-server 压缩、微压缩与工具结果裁剪。
+
+    kw：session_id / old_session_id / kind / reason / before_tokens / after_tokens /
+    messages_removed；返回值被忽略（纯观察）。
+
+    epoch 只在「逻辑输入被重写」的 kind 上抬（默认 summarize / micro_summarize /
+    provider_native）：那是缓存前缀真正失效的时刻。prune_tool_results 只裁短工具结果、
+    消息条数不变，默认不算；``AGENT_HINT_EPOCH_ON`` 可改口径。
+    """
+    if not _on():
+        return
+    sid = _sid(kw)
+    if not sid:
+        return
+    allowed = _settings.epoch_on()
+    kind = kw.get("kind")
+    if allowed is not None:
+        if not allowed:
+            return
+        # kind 缺失（宿主没给）时按"重写过"处理：宁可多抬一代，也不漏掉一次真重写。
+        if kind is not None and str(kind) not in allowed:
+            return
+    _state.bump_epoch(sid)
 
 
 # --- middleware ---

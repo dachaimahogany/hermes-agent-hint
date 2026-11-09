@@ -24,6 +24,9 @@ _DEFAULTS = {
     # 部署方声明的会话血缘（JSON）。Hermes 原生只有 spawn（subagent_start），
     # fork 只能由创建该会话的一方声明。
     "lineage": "",
+    # 哪些 post_compaction 的 kind 算「上下文重写」、要抬会话 epoch。默认三档重写语义；
+    # prune_tool_results（裁工具结果、消息条数不变）默认不算，需要时显式加。
+    "epoch_on": "summarize,micro_summarize,provider_native",
 }
 
 _ctx = None
@@ -203,6 +206,24 @@ def next_action_map():
     except Exception:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def epoch_on():
+    """哪些 ``post_compaction.kind`` 算「上下文重写」、要抬会话 epoch。
+
+    宿主的 kind 闭合集是 ``summarize / micro_summarize / prune_tool_results /
+    provider_native``（``agent/compaction_events.py:33``）。默认取前三档中的三档重写语义
+    （``prune_tool_results`` 不在内：它只裁短工具结果，消息条数不变，抬 epoch 会让分代
+    跟着"裁剪"抖动），需要时用 ``AGENT_HINT_EPOCH_ON=all`` 或显式列表加进来。
+
+    返回 ``frozenset()`` = 一律不抬；``None`` = 所有 kind 都抬；否则为命中集合。
+    """
+    raw = str(_get("epoch_on") or "").strip().lower()
+    if raw in ("", "none", "off", "0", "false"):
+        return frozenset()
+    if raw in ("all", "*"):
+        return None
+    return frozenset(part.strip() for part in raw.split(",") if part.strip())
 
 
 def lineage():

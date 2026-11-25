@@ -160,18 +160,26 @@ byte-for-byte:
 {
   "session": {
     "session_id": "20261012_093707_…",
-    "agent_type": "office-agent",
+    "state": "append",
     "call_index": 1,
     "epoch": 0
   },
-  "agent_status": { "state": "running", "state_since_ms": 1791769027861 },
-  "priority": { "level": 3, "reason": "user_waiting" },
-  "cache_control": { "type": "pin", "range": { "end": 1 } }
+  "priority_control": { "priority": { "level": 3, "reason": "user_waiting" } },
+  "cache_control": { "type": "ephemeral", "ttl_s": 300, "msg_offset": 1 }
 }
 ```
 
-(`agent_type` and the priority policy are configuration, not constants; the values above are what
-the deployment set. The session id is shortened here.)
+**Protocol note.** The header above is the **normalized** four-block shape defined by
+`docs/design/20261125-01-merged-header-protocol.md` in
+[`evan7ang/dsh-agent-hints`](https://github.com/evan7ang/dsh-agent-hints) — the shape the current
+build emits. The nine requests were captured on 2026-10-12, i.e. under the preceding revision of the
+header, which additionally carried `session.agent_type`, an `agent_status` block (internal lifecycle:
+`running` / `tool` / `pause` / `finalize`) and `cache_control.range`. Those three were removed in the
+normalization: an engine consumes "may I drop this context" from a dedicated manage request, not
+"the agent is running a tool" from every ordinary call. The fields the measurements below actually
+rest on — `session_id`, `call_index`, `priority_control.priority.level` — are identical in both
+revisions, so the routing and cache numbers are unaffected by the change. The priority policy
+(`level: 3` here) and the TTL are configuration, not constants. The session id is shortened.
 
 Observed across the nine:
 
@@ -182,8 +190,9 @@ Observed across the nine:
   boundary is "header only", and the plugin respects it.
 - **Control-plane-only fields stay with the control plane:** fields the spec reserves (e.g.
   `strict_priority`) are never emitted by the agent side.
-- `cache_control` was emitted as a single object; the schema permits object or array, and both
-  sides parsed it without complaint.
+- `cache_control` was emitted as a single object, and stays a single object in the normalized
+  schema: one `ephemeral` entry with an explicit `ttl_s` and a `msg_offset`, instead of the earlier
+  `range: {end, unit}` nesting.
 
 ## 5. Cross-check against an independent implementation
 
@@ -229,7 +238,7 @@ Stated plainly, because a report that only lists wins is not useful:
   was logged as `prio=1`, while a replay of the same header logged `prio=3`. Tracked as an
   engine-side investigation; the agent side emits what the schema says it emits.
 - **A prefix longer than `max_model_len` is rejected (HTTP 400)** — expected, but worth knowing
-  when sizing `cache_control` ranges.
+  when sizing the prefix a `cache_control.msg_offset` points into.
 - No claim here about **cost** (NPU-seconds) or behaviour **under high concurrent load**; this
   run covers latency and routing behaviour.
 

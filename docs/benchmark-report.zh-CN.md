@@ -140,17 +140,24 @@ session affinity hit session_id=sess-hermes-x parent_session_id=sess-hermes-x in
 {
   "session": {
     "session_id": "20261012_093707_…",
-    "agent_type": "office-agent",
+    "state": "append",
     "call_index": 1,
     "epoch": 0
   },
-  "agent_status": { "state": "running", "state_since_ms": 1791769027861 },
-  "priority": { "level": 3, "reason": "user_waiting" },
-  "cache_control": { "type": "pin", "range": { "end": 1 } }
+  "priority_control": { "priority": { "level": 3, "reason": "user_waiting" } },
+  "cache_control": { "type": "ephemeral", "ttl_s": 300, "msg_offset": 1 }
 }
 ```
 
-（`agent_type` 与优先级策略属于配置项而非常量，以上是该部署的取值；session_id 此处已截短。）
+**协议说明。** 上面是归一化之后的**四块**形态，权威定义见
+[`evan7ang/dsh-agent-hints`](https://github.com/evan7ang/dsh-agent-hints) 的
+`docs/design/20261125-01-merged-header-protocol.md`，也就是当前代码实际发射的形态。而这 9 条请求抓取于
+2026-10-12，当时用的还是上一版 header，另外还带 `session.agent_type`、`agent_status` 块（内部生命周期：
+`running` / `tool` / `pause` / `finalize`）以及 `cache_control.range`。这三项在归一化中被移除 —— 引擎需要
+的是「这块上下文能不能丢」，它由一条专用的 manage 请求给出，而不是从每一次普通调用里读「agent 正在跑
+工具」。本节测量实际依赖的字段 —— `session_id`、`call_index`、`priority_control.priority.level` ——
+两版完全一致，因此下面的路由与前缀缓存结论不受影响。优先级策略（此处 `level: 3`）与 TTL 属于配置项。
+session_id 此处已截短。
 
 9 条请求的观察结论：
 
@@ -159,7 +166,8 @@ session affinity hit session_id=sess-hermes-x parent_session_id=sess-hermes-x in
 - 引擎侧**解码失败 0 次**。
 - **请求体保持干净：** 9 个请求体均不含任何 hint 字段 —— 协议边界是「只走 header」，插件遵守了它。
 - **控制面专属字段留给控制面：** 规范保留给控制面的字段（如 `strict_priority`）agent 侧永不发射。
-- `cache_control` 以单对象形态发射；规范允许单对象或数组，两侧解析均无报错。
+- `cache_control` 以单对象形态发射，归一化后仍是单对象：一条 `ephemeral` + 显式 `ttl_s` + `msg_offset`，
+  不再有早先那层 `range: {end, unit}` 嵌套。
 
 ## 5. 与一个独立实现的交叉印证
 

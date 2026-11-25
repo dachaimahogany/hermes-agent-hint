@@ -1,10 +1,10 @@
 name: agent-hint
-version: "0.10.0"
+version: "0.11.0"
 author: dachaimahogany
 description: "Gives the inference engine a machine-readable view of the agent session behind each
-  request: adds a standard X-Agent-Hint header (base64url JSON) to main LLM requests and can report
-  agent_status lifecycle events out of band. Never touches the request body, stdlib-only, removable,
-  off by default."
+  request: adds a standard X-Agent-Hint header (base64url JSON, four blocks) to main LLM requests
+  and sends dedicated manage requests for pause/resume/stop/compact. Never touches the request
+  body, stdlib-only, removable, off by default."
 requires_hermes: ">=0.21.6"
 tags: [agent-hint, inference-engine, scheduling, observability, middleware]
 
@@ -29,53 +29,56 @@ config_schema:
   enabled:
     type: bool
     required: false
-    description: "Master switch. Default false: no header is injected and no events are sent
-      (the middleware and every hook return early)."
-  agent_type:
-    type: str
-    required: false
-    description: "Value written to session.agent_type (the agent/role label). Default: hermes.
-      Set per role in multi-agent deployments."
+    description: "Master switch. Default false: no header is injected and no manage request is
+      sent (the middleware and every hook return early)."
   priority_level:
     required: false
-    description: "priority.level, folded to the two-level contract {1, 3}: >= 3 becomes 3 (a person is waiting), anything else 1. <= 0 omits the whole priority block. Default: 3."
-  priority_reason:
+    description: "priority_control.priority.level, folded to the two-level contract {1, 3}: >= 3
+      becomes 3 (a person is waiting, reason user_waiting), anything else 1 (reason critical_path).
+      <= 0 omits the whole priority_control block. Default: 3."
+  cache_pin_end:
+    required: false
+    description: "cache_control.msg_offset: auto (default) = end of the current logical input,
+      system prompt included; 0 = emit no declaration; an integer pins an explicit offset.
+      Historical name kept for config compatibility."
+  cache_ttl_s:
+    required: false
+    description: "cache_control.ttl_s: auto (default) = clamp(round(idle interval x 2), 60, 3600);
+      0 = emit no declaration; an integer outside [60, 3600] is treated as 0."
+  manage_sink:
     type: str
     required: false
-    description: "priority.reason text. Default: user_waiting."
-  status_sink:
+    description: "manage request transport: ndjson | http | none. Default: none (nothing written
+      locally, no network). Setting manage_url makes http the default."
+  manage_url:
     type: str
     required: false
-    description: "Event transport: ndjson | http | none. Default: none (nothing written locally,
-      no network). Setting status_url makes http the default."
-  status_url:
+    description: "Target URL for manage requests (POST, empty messages body). Empty = no network
+      requests at all."
+  manage_model:
     type: str
     required: false
-    description: "Target URL for the http sink (JSON POST). Empty = no network requests at all."
-  finalize_on:
+    description: "Model name placed in the manage request body. Required when manage_url is set:
+      a request without a model is not routable."
+  manage_token_env:
     type: str
     required: false
-    description: "When to emit the finalize event: session_end | session_finalize.
-      Default: session_end."
-  suspend_after_s:
+    description: "Environment variable name holding the bearer token for manage requests.
+      Default: AGENT_HINT_TOKEN. Empty or unset means no Authorization header."
+  manage_timeout_s:
     required: false
-    description: "Emit a suspend event once an approval has been pending this many seconds
-      (integer; 0 = disabled). Default: 0."
+    description: "Per-request timeout for manage requests, clamped to [1, 30]. Default: 5."
+  manage_max_retries:
+    required: false
+    description: "Retries after the first attempt, clamped to [0, 3]. Default: 1."
+  manage_queue_limit:
+    required: false
+    description: "Bounded queue depth for manage requests; the oldest is dropped when full.
+      Clamped to [1, 1024]. Default: 64."
   epoch_on:
     type: str
     required: false
     description: "Which post_compaction kinds count as a context rewrite and bump session.epoch:
       comma list over the host's closed set (summarize, micro_summarize, prune_tool_results,
       provider_native), or all / none. Default: summarize,micro_summarize,provider_native
-      (prune_tool_results only trims tool results and leaves the message count unchanged)."  cache_pin_end:
-    required: false
-    description: "Breakpoint position (range.end) of the single ephemeral declaration.
-      auto (default) = end of the current logical input, system prompt included;
-      0 = emit no declaration; an integer pins an explicit position. Historical name
-      kept for config compatibility."
-  next_action_map:
-    type: str
-    required: false
-    description: "Generic prediction.next_action mapping (JSON string), e.g.
-      {\"research_\": [\"analysis_run\", 8, \"tool\"], \"__default__\": [null, 0, \"tool\"]}.
-      Empty (the default) omits next_action and remaining_calls entirely."
+      (prune_tool_results only trims tool results and leaves the message count unchanged)."

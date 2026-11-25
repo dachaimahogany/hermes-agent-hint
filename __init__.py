@@ -2,7 +2,16 @@
 
 零侵入：只依赖 ctx（register_hook / register_middleware / get_config）与标准库，
 不 import 任何 hermes 内部模块。关闭态（enabled=0，默认）中间件与 hooks 均在入口早退（us 级）。
+
+线格式的权威定义是 dsh 仓库的
+``docs/design/20261125-01-merged-header-protocol.md``：只有四块，``session.state`` 六值，
+``pause`` / ``resume`` / ``stop`` / ``compact`` 各由一次**专用 manage 请求**承载。
+运行中状态（``running`` / ``tool`` / ``pause`` / ``finalize``）留在 ``_state`` 里，
+不上线——引擎不需要知道 Agent 此刻在干什么，只需要知道这一轮之后要不要卸载上下文。
 """
+import hashlib
+import json
+
 from . import _builder, _codec, _settings, _sink, _state, _stats
 
 
@@ -43,6 +52,51 @@ def _on():
     return _settings.enabled()
 
 
+def _tools_signature(request):
+    """``model + tools`` 的摘要：它变了就等于引擎眼里的前缀全变了。
+
+    缓存键包含工具定义，工具集一换，旧前缀一个字节都复用不上，此时声明保留是在
+    保护一个不存在的对象。
+    """
+    payload = {
+        "model": str(request.get("model") or ""),
+        "tools": request.get("tools") or [],
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _has_empty_assistant(messages):
+    """消息里存在空的 assistant 消息 -> 这一轮的前缀写不完整，不声明保留。"""
+    if not isinstance(messages, list):
+        return False
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        content = message.get("content")
+        if content is None:
+            return True
+        if isinstance(content, str) and not content.strip():
+            return True
+        if isinstance(content, list) and not content:
+            return True
+    return False
+
+
+def _emit_manage(sid, verb):
+    """下发一次 manage 请求；失败静默（``_sink`` 内部 warn-once）。"""
+    if verb == "compact":
+        epoch = _state.bump_epoch(sid)  # 先抬 epoch，编辑才作用在刚被重写掉的那一代
+        call_index, _epoch, parent = _state.peek(sid)
+    else:
+        call_index, epoch, parent = _state.peek(sid)
+    hint = _builder.build_manage_hint(
+        session_id=sid, call_index=call_index, epoch=epoch,
+        state=verb, parent_session_id=parent,
+    )
+    return _sink.dispatch(hint)
+
+
 # --- hooks ---
 
 def _on_session_start(**kw):
@@ -51,8 +105,7 @@ def _on_session_start(**kw):
     sid = _sid(kw)
     if not sid:
         return
-    since = _state.set_state(sid, "running")
-    _sink.emit(_builder.status_event(sid, "running", since_ms=since))
+    _state.set_state(sid, "running")
 
 
 def _on_session_end(**kw):
@@ -62,10 +115,7 @@ def _on_session_end(**kw):
     if not sid:
         return
     _state.clear_inflight(sid)  # turn 结束清在飞兜底
-    if _settings.finalize_on() == "session_end":
-        reason = None if kw.get("completed") else str(kw.get("turn_exit_reason") or "interrupted")
-        since = _state.set_state(sid, "finalize")
-        _sink.emit(_builder.status_event(sid, "finalize", since_ms=since, reason=reason))
+    _state.set_state(sid, "finalize")  # 内部状态：下一次请求据此判定“新一轮”
 
 
 def _on_session_finalize(**kw):
@@ -74,11 +124,8 @@ def _on_session_finalize(**kw):
     sid = _sid(kw)
     if not sid:
         return
-    if _settings.finalize_on() == "session_finalize":
-        # 会话级模式：finalize 是会话级终态，一个会话至多一次，且必须是它的最后一条事件。
-        since = _state.set_state(sid, "finalize")
-        _sink.emit(_builder.status_event(sid, "finalize", since_ms=since))
-    _state.drop(sid)  # 会话真关闭回收（接缝）
+    _emit_manage(sid, "stop")
+    _state.drop(sid)  # 会话真关闭回收
 
 
 def _on_pre_tool_call(**kw):
@@ -87,13 +134,7 @@ def _on_pre_tool_call(**kw):
     sid = _sid(kw)
     if not sid:
         return None
-    name = str(kw.get("tool_name") or "")
-    call_id = str(kw.get("tool_call_id") or "")
-    _stats.note_tool(sid, name)  # prediction 启发式：最近工具名
-    since = _state.tool_started(sid, call_id)
-    _sink.emit(_builder.status_event(sid, "tool", since_ms=since,
-                                     reason="await_tool",
-                                     tools=[{"name": name, "call_id": call_id}]))
+    _state.tool_started(sid, str(kw.get("tool_call_id") or ""))
     return None  # 纯观察，绝不返回 block/approve/modify
 
 
@@ -103,10 +144,7 @@ def _on_post_tool_call(**kw):
     sid = _sid(kw)
     if not sid:
         return
-    _stats.note_tool_done(sid)  # prediction：结算工具耗时，供 TTL 估计
-    since = _state.tool_finished(sid, str(kw.get("tool_call_id") or ""))
-    if since is not None:  # 集合清空 -> 回 running（R3）
-        _sink.emit(_builder.status_event(sid, "running", since_ms=since))
+    _state.tool_finished(sid, str(kw.get("tool_call_id") or ""))
 
 
 def _on_pre_approval_request(**kw):
@@ -115,9 +153,8 @@ def _on_pre_approval_request(**kw):
     sid = _sid(kw)
     if not sid:
         return
-    since = _state.set_state(sid, "pause")
-    _sink.emit(_builder.status_event(sid, "pause", since_ms=since, reason="human_approval"))
-    _state.start_suspend_watchdog(sid, _settings.suspend_after_s())
+    _state.set_state(sid, "pause")
+    _emit_manage(sid, "pause")
 
 
 def _on_post_approval_response(**kw):
@@ -126,28 +163,21 @@ def _on_post_approval_response(**kw):
     sid = _sid(kw)
     if not sid:
         return
-    _state.cancel_suspend_watchdog(sid)
-    since = _state.set_state(sid, "running")
-    # 放行是一次性边：事件通道与请求头同一套四值，两边都只报一次 resume（同一时刻），
-    # 之后再出现的状态是 running。挂在会话状态上会让后面每条请求都报它，所以边只走一次。
-    _state.mark_resume(sid, since_ms=since)
-    _sink.emit(_builder.status_event(sid, "resume", since_ms=since, reason="human_approval"))
+    _state.set_state(sid, "running")
+    _emit_manage(sid, "resume")
 
 
 def _on_subagent_start(**kw):
     if not _on():
         return
-    parent_sid = str(kw.get("parent_session_id") or "")
-    child_sid = str(kw.get("child_session_id") or "")
-    child_role = str(kw.get("child_role") or "")
-    _state.subagent_start(parent_sid, child_sid, child_role)
+    _state.subagent_start(str(kw.get("parent_session_id") or ""),
+                          str(kw.get("child_session_id") or ""))
 
 
 def _on_subagent_stop(**kw):
     if not _on():
         return
-    child_sid = str(kw.get("child_session_id") or "")
-    _state.subagent_stop(child_sid)
+    _state.subagent_stop(str(kw.get("child_session_id") or ""))
 
 
 def _on_post_api_request(**kw):
@@ -156,18 +186,18 @@ def _on_post_api_request(**kw):
     _stats.collect(**kw)
 
 
-# 宿主的压缩 kind 闭合集（agent/compaction_events.py:33）；epoch 换代口径见 _settings.epoch_on
+# 宿主的压缩 kind 闭合集（agent/compaction_events.py:33）；换代口径见 _settings.epoch_on
 def _on_post_compaction(**kw):
-    """每次**已提交**压缩之后回调一次（hermes ≥0.21.6：plugins.py 的 post_compaction，
-    fire 点 agent/compaction_events.py:239），覆盖自动/手动压缩、overflow 恢复、
-    网关 /compress、Codex app-server 压缩、微压缩与工具结果裁剪。
+    """每次**已提交**压缩之后回调一次（hermes >=0.21.6 的 post_compaction）。
 
+    覆盖自动/手动压缩、overflow 恢复、网关 /compress、微压缩与工具结果裁剪。
     kw：session_id / old_session_id / kind / reason / before_tokens / after_tokens /
     messages_removed；返回值被忽略（纯观察）。
 
-    epoch 只在「逻辑输入被重写」的 kind 上抬（默认 summarize / micro_summarize /
-    provider_native）：那是缓存前缀真正失效的时刻。prune_tool_results 只裁短工具结果、
-    消息条数不变，默认不算；``AGENT_HINT_EPOCH_ON`` 可改口径。
+    只有「逻辑输入被重写」的 kind 才换代（默认 summarize / micro_summarize /
+    provider_native）。换代走 ``compact`` manage 请求：它先抬 epoch，再把编辑作用在
+    ``epoch - 1``——刚被重写掉的那一代。宿主没给 kind 时按"重写过"处理：宁可多抬
+    一代，也不漏掉一次真重写。
     """
     if not _on():
         return
@@ -175,14 +205,29 @@ def _on_post_compaction(**kw):
     if not sid:
         return
     allowed = _settings.epoch_on()
-    kind = kw.get("kind")
     if allowed is not None:
         if not allowed:
             return
-        # kind 缺失（宿主没给）时按"重写过"处理：宁可多抬一代，也不漏掉一次真重写。
+        kind = kw.get("kind")
         if kind is not None and str(kind) not in allowed:
             return
-    _state.bump_epoch(sid)
+    _emit_manage(sid, "compact")
+
+
+# --- 显式入口（上游没有稳定的 compaction hook 时由调用方直接调用） ---
+
+def notify_compact(session_id=None, **_kw):
+    """上下文刚被重写：抬高 epoch 并下发 ``compact`` manage 请求。
+
+    ``compact`` 的编辑作用在 ``epoch - 1``（刚被重写掉的那一代），新 epoch 的内容
+    是这一轮的输入，卸载它等于卸载刚写好的东西。
+    """
+    if not _on():
+        return False
+    sid = str(session_id or _kw.get("session_id") or "")
+    if not sid:
+        return False
+    return _emit_manage(sid, "compact")
 
 
 # --- middleware ---
@@ -210,50 +255,45 @@ def _on_llm_request(**kw):
     if not isinstance(req, dict):
         return None
     if _is_aux_request(kw):
-        # 辅助请求豁免：原样放行，不带 hint、不推进 call_index（RFC §1.3/§3.3.5）。
+        # 辅助请求豁免：原样放行，不带 hint，也不推进 call_index（RFC §1.3/§3.3.5）。
         return None
     sid = _sid(kw)
     if not sid:
         return None
     try:
-        call_index, state, since_ms, epoch, resumed = _state.note_call(
+        call_index, _state_name, _since, epoch, _resumed = _state.note_call(
             sid, str(kw.get("api_request_id") or ""))
-        if resumed:  # M4：finalize -> running 边，补发 running 事件
-            _sink.emit(_builder.status_event(sid, "running", since_ms=since_ms))
-        parent_session_id, derivation = _state.lineage(sid)
-        # 一次快照同时喂 prediction 与 TTL 推导，避免重复统计。
-        prediction = _stats.snapshot(sid, next_action_map=_settings.next_action_map())
-        ttl_s = _settings.cache_ttl_s()
-        if ttl_s is None:
-            observed = prediction or {}
-            next_action = observed.get("next_action") or {}
-            tools = next_action.get("tools") or []
-            ttl_s = _builder.estimate_ttl_s(
-                tool_expected_duration_s=tools[0].get("expected_duration_s") if tools else None,
-                interval_ms=observed.get("interval_ms"),
+        parent_session_id = _state.lineage(sid)
+        messages = req.get("messages")
+
+        # 三种情况下这一轮不该声明保留：前缀刚被重写、工具集/模型变了、前缀里还有写了一半的
+        # assistant 消息。三者都意味着“下一轮能复用的东西”与此刻信封里的东西不是同一份。
+        rewrite = _state.consume_rewrite(sid)
+        signature_changed = _state.note_signature(sid, _tools_signature(req))
+        cache = None
+        if not rewrite and not signature_changed and not _has_empty_assistant(messages):
+            ttl_s = _settings.cache_ttl_s()
+            if ttl_s is None:
+                ttl_s = _builder.estimate_ttl_s(interval_ms=_stats.interval_ms(sid))
+            cache = _builder.cache_control(
+                messages,
+                ttl_s=ttl_s,
+                # None = auto：偏移落在当前逻辑输入末尾（含 system）。
+                end=_settings.cache_pin_end(),
             )
+
+        level = _settings.priority_level()
         hint = _builder.request_hint(
             session_id=sid, call_index=call_index, epoch=epoch,
-            agent_type=_state.agent_type(sid, _settings.agent_type()),
-            parent_session_id=parent_session_id, derivation=derivation,
-            state=state, state_since_ms=since_ms,
-            priority=_settings.priority(),
-            cache_control=_builder.cache_control(
-                req,
-                # None = auto：断点落在当前逻辑输入末尾（与 Pi 一致）。显式配置仍然生效。
-                end=_settings.cache_pin_end() if _settings.cache_pin_end() is not None
-                else len(req.get("messages") or []),
-                ttl_s=ttl_s or 0,
-                task_end=_settings.cache_task_end() or None,
-            ),
-            prediction=prediction,
+            state=_builder.ordinary_state(call_index),
+            parent_session_id=parent_session_id,
+            priority=_builder.priority_block(level) if level is not None else None,
+            cache_control=cache,
         )
         req = dict(req)  # 浅拷贝顶层（COW，绝不改入参）
         headers = dict(req.get("extra_headers") or {})
-        headers["X-Agent-Hint"] = _codec.encode(hint)
+        headers[_builder.HINT_HEADER] = _codec.encode(hint)
         req["extra_headers"] = headers
-        # resume / finalize 都是一次性边：note_call 已经在状态机里把边消费掉
-        # （pending_resume 清零、finalize_served 置位），不需要在这里再翻状态。
         return {"request": req}
     except Exception as e:
         _sink._warn_once("llm_request", "hint build failed (kept request as-is): " + str(e))

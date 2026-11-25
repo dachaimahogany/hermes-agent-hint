@@ -1,7 +1,10 @@
-"""agent-hint 插件单测（v0.5.0）。
+"""agent-hint 插件单测（v0.8.0，归一化四块协议）。
 
 覆盖 _codec / _builder / _state / _stats / _settings / _sink 六模块 + 中间件/hooks 契约。
 装载：conftest 的 ah_plugin fixture（importlib 包方式，相对导入可用）。
+
+协议权威定义：dsh ``docs/design/20261125-01-merged-header-protocol.md``。
+本文件同时是“退役字段不再出现”的守卫——任何一块被悄悄加回来，这里会红。
 """
 import json
 
@@ -13,17 +16,21 @@ import pytest
 @pytest.fixture(autouse=True)
 def _reset_global(ah_plugin, monkeypatch):
     """每例前重置进程内状态 + 清缓存快照；结束后再清，避免跨例污染。"""
-    ah_plugin._state._reset()
-    ah_plugin._stats._reset()
-    ah_plugin._settings._ctx = None
-    ah_plugin._settings._reset()
-    ah_plugin._sink._ndjson_path = None
-    ah_plugin._sink._warned.clear()
+    def _clear():
+        ah_plugin._state._reset()
+        ah_plugin._stats._reset()
+        ah_plugin._settings._ctx = None
+        ah_plugin._settings._reset()
+        ah_plugin._sink._ndjson_path = None
+        ah_plugin._sink._warned.clear()
+        ah_plugin._sink.reset_state()
+        ah_plugin._sink._http_q = None
+        ah_plugin._sink._http_worker = None
+        ah_plugin._sink._http_url = None
+
+    _clear()
     yield
-    ah_plugin._state._reset()
-    ah_plugin._stats._reset()
-    ah_plugin._settings._ctx = None
-    ah_plugin._settings._reset()
+    _clear()
 
 
 class _FakeCtx:
@@ -32,6 +39,32 @@ class _FakeCtx:
 
     def get_config(self, key, default=None):
         return self._cfg.get(key, default)
+
+
+class _Registry:
+    """记录 register(ctx) 真实注册了哪些 hook / middleware。"""
+
+    def __init__(self):
+        self.hooks = {}
+        self.middleware = {}
+
+    def register_hook(self, name, cb):
+        self.hooks[name] = cb
+
+    def register_middleware(self, name, cb):
+        self.middleware[name] = cb
+
+
+LONG_PREFIX = "lorem ipsum dolor sit amet " * 40  # ~1080 chars，约 270 token，超过一个块
+
+RETIRED_BLOCKS = ("agent_status", "prediction", "derivation", "agent_type",
+                  "strict_priority", "latency_control")
+
+
+def _decode_headers(result):
+    raw = (result.get("request") or {}).get("extra_headers", {}).get("X-Agent-Hint")
+    assert isinstance(raw, str), "the middleware must inject the hint header"
+    return json.loads(__import__("base64").urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode())
 
 
 # ---------------- _codec ----------------
@@ -55,131 +88,182 @@ def test_codec_decode_invalid_raises(ah_plugin):
         ah_plugin._codec.decode("!!not-base64!!")
 
 
-# ---------------- _builder ----------------
+# ---------------- _builder: 四块 ----------------
 
-def test_request_hint_full_fields(ah_plugin):
+def test_request_hint_full_blocks(ah_plugin):
     b = ah_plugin._builder
-    h = b.request_hint(session_id="s1", call_index=2, epoch=0, agent_type="office-agent",
-                       state="running", state_since_ms=1000,
-                       priority={"level": 3, "reason": "user_waiting"},
-                       cache_control={"type": "pin", "range": {"end": 1}},
-                       prediction={"remaining_calls": 4})
-    assert h["session"] == {"session_id": "s1", "agent_type": "office-agent",
-                            "call_index": 2, "epoch": 0}
-    assert h["agent_status"] == {"state": "running", "state_since_ms": 1000}
-    assert "strict_priority" not in h  # 控制面注入，Agent 永不写
-    assert h["priority"]["level"] == 3
+    hint = b.request_hint(
+        session_id="s1", call_index=2, epoch=0, state="append",
+        parent_session_id="s-parent",
+        priority={"level": 3, "reason": "user_waiting"},
+        cache_control={"type": "ephemeral", "ttl_s": 120, "msg_offset": 4},
+    )
+    assert hint["session"] == {"session_id": "s1", "state": "append",
+                               "call_index": 2, "epoch": 0, "parent_session_id": "s-parent"}
+    assert hint["priority_control"] == {"priority": {"level": 3, "reason": "user_waiting"}}
+    assert hint["cache_control"] == {"type": "ephemeral", "ttl_s": 120, "msg_offset": 4}
+    assert "context_management" not in hint  # 只有 manage 请求带它
 
 
-def test_request_hint_omits_optional(ah_plugin):
+def test_request_hint_omits_optional_blocks(ah_plugin):
     b = ah_plugin._builder
-    h = b.request_hint(session_id="s1", call_index=1, epoch=0, agent_type="office-agent",
-                       state="running", state_since_ms=1)
-    # 根会话：无 parent_session_id / derivation
-    assert "parent_session_id" not in h["session"]
-    assert "derivation" not in h["session"]
-    assert "priority" not in h
-    assert "cache_control" not in h
-    assert "prediction" not in h
+    hint = b.request_hint(session_id="s1", call_index=1, epoch=0, state="start")
+    assert set(hint) == {"session"}  # 根会话：无 parent，无 priority，无 cache
+    assert set(hint["session"]) == {"session_id", "state", "call_index", "epoch"}
 
 
-def test_request_hint_subagent(ah_plugin):
+def test_request_hint_carries_no_retired_blocks(ah_plugin):
     b = ah_plugin._builder
-    h = b.request_hint(session_id="s-child", call_index=1, epoch=0, agent_type="leaf",
-                       state="running", state_since_ms=1,
-                       parent_session_id="s-parent",
-                       derivation={"relation": "spawn", "join": "sync"})
-    assert h["session"]["parent_session_id"] == "s-parent"
-    assert h["session"]["derivation"] == {"relation": "spawn", "join": "sync"}
+    hint = b.request_hint(session_id="s1", call_index=1, epoch=0, state="start",
+                          parent_session_id="p",
+                          priority={"level": 1, "reason": "critical_path"},
+                          cache_control={"type": "ephemeral", "ttl_s": 60, "msg_offset": 1})
+    for name in RETIRED_BLOCKS:
+        assert name not in hint, name
+        assert name not in hint["session"], name
+    assert "range" not in hint["cache_control"]  # 单对象，没有 range/unit
 
 
-def test_status_event_reason_tools_optional(ah_plugin):
+def test_request_hint_refuses_manage_states(ah_plugin):
     b = ah_plugin._builder
-    e = b.status_event("s1", "running", since_ms=5)
-    assert e == {"session": {"session_id": "s1"},
-                 "agent_status": {"state": "running", "state_since_ms": 5}}
-    e2 = b.status_event("s1", "tool", since_ms=6, reason="await_tool",
-                        tools=[{"name": "research_web_search", "call_id": "c1"}])
-    assert e2["agent_status"]["reason"] == "await_tool"
-    assert e2["agent_status"]["tools"][0]["call_id"] == "c1"
+    for state in b.MANAGE_STATES:
+        with pytest.raises(ValueError):
+            b.request_hint(session_id="s1", call_index=1, epoch=0, state=state)
 
 
-LONG_PREFIX = "lorem ipsum dolor sit amet " * 40  # ~1080 chars, 约 270 token，超过一个块
-
-
-def test_cache_control_requires_explicit_ttl(ah_plugin):
+def test_ordinary_state_is_start_only_for_the_first_call(ah_plugin):
     b = ah_plugin._builder
-    req = {"messages": [{"role": "system"}, {"role": "user"}]}
-    # pin 已退役：没有显式 TTL 就没有可声明的保留
-    assert b.cache_control(req, end=1) is None
-    assert b.cache_control({"messages": []}, end=1) is None
-    assert b.cache_control({"no": "messages"}, end=1) is None
-    assert b.cache_control({"messages": [{"role": "system"}]}, end=0) is None
-    # 断点越界：宁可不发，也不发一个错位的声明
-    assert b.cache_control(req, end=5) is None
+    assert b.ordinary_state(0) == "start"
+    assert b.ordinary_state(1) == "start"
+    assert b.ordinary_state(2) == "append"
+    assert b.ordinary_state("oops") == "append"
 
 
-def test_cache_control_ephemeral_carries_ttl(ah_plugin):
+# ---------------- _builder: priority_control ----------------
+
+@pytest.mark.parametrize("configured,expected", [
+    (1, 1), (2, 1), (3, 3), (4, 3), (90, 3), (-1, 1),
+])
+def test_priority_block_folds_level_and_pairs_reason(ah_plugin, configured, expected):
+    """level 只保留 {1, 3}，reason 由 level 推导——协议不允许二者自相矛盾。"""
+    block = ah_plugin._builder.priority_block(configured)
+    assert block["level"] == expected
+    assert block["reason"] == ("user_waiting" if expected == 3 else "critical_path")
+
+
+def test_priority_reason_pairs_are_frozen(ah_plugin):
     b = ah_plugin._builder
-    req = {"messages": [{"role": "system"}, {"role": "user", "content": LONG_PREFIX}, {"role": "assistant"}]}
-    controls = b.cache_control(req, end=1, ttl_s=120)
-    assert controls == [
-        {"type": "ephemeral", "ttl_s": 120, "range": {"end": 1, "unit": "message"}},
-    ]
-    # ttl_s<=0：不发任何条目（单一断点 + 显式 TTL 是唯一形态）
-    assert b.cache_control(req, end=1, ttl_s=0) is None
+    assert set(b.PRIORITY_REASON_BY_LEVEL) == {1, 3}
+    assert b.PRIORITY_REASONS == ("user_waiting", "critical_path")
+    with pytest.raises(TypeError):
+        b.PRIORITY_REASON_BY_LEVEL[2] = "whatever"
 
 
-def test_cache_control_second_breakpoint_widens_the_ephemeral(ah_plugin):
+# ---------------- _builder: cache_control ----------------
+
+def test_cache_control_is_one_object_with_message_offset(ah_plugin):
     b = ah_plugin._builder
-    req = {"messages": [{"role": f"m{i}", "content": LONG_PREFIX} for i in range(6)]}
-    controls = b.cache_control(req, end=2, ttl_s=300, task_end=5)
-    assert controls == [{"type": "ephemeral", "ttl_s": 300, "range": {"end": 5, "unit": "message"}}]
-    # task_end 不大于 end 时不加宽（等于只是重复声明）
-    assert b.cache_control(req, end=2, ttl_s=300, task_end=2)[0]["range"]["end"] == 2
-    # task_end 越界时不采信
-    assert b.cache_control(req, end=2, ttl_s=300, task_end=99)[0]["range"]["end"] == 2
+    messages = [{"role": "system", "content": LONG_PREFIX}, {"role": "user", "content": "hi"}]
+    block = b.cache_control(messages, ttl_s=120)
+    assert block == {"type": "ephemeral", "ttl_s": 120, "msg_offset": 2}
+    assert set(block) == {"type", "ttl_s", "msg_offset"}
 
 
-def test_cache_ttl_distinguishes_auto_pin_only_and_fixed(ah_plugin, monkeypatch):
-    s = ah_plugin._settings
-    # auto（缺省 / 显式写法）-> None，表示按运行时信号推导
-    for raw in ("", "auto", "none", "null"):
-        monkeypatch.setenv("AGENT_HINT_CACHE_TTL_S", raw)
-        s._reset()
-        assert s.cache_ttl_s() is None, raw
-    # 0 或越界/非法值 -> 只发 pin（不发一个会被消费侧改写的值）
-    for raw in ("0", "59", "3601", "-5", "abc"):
-        monkeypatch.setenv("AGENT_HINT_CACHE_TTL_S", raw)
-        s._reset()
-        assert s.cache_ttl_s() == 0, raw
-    # 合法区间 -> 固定值
-    monkeypatch.setenv("AGENT_HINT_CACHE_TTL_S", "120")
-    s._reset()
-    assert s.cache_ttl_s() == 120
-
-
-def test_estimate_ttl_s_prefers_tool_budget_then_interval(ah_plugin):
+def test_cache_control_explicit_offset(ah_plugin):
     b = ah_plugin._builder
-    assert b.estimate_ttl_s(tool_expected_duration_s=120, interval_ms=5000) == 240
-    assert b.estimate_ttl_s(interval_ms=5000) == 60      # 10s -> 抬到下限 60
+    messages = [{"role": f"m{i}", "content": LONG_PREFIX} for i in range(6)]
+    assert b.cache_control(messages, ttl_s=300, end=2)["msg_offset"] == 2
+    assert b.cache_control(messages, ttl_s=300, end=0) is None    # 0 = 不发
+    assert b.cache_control(messages, ttl_s=300, end=99) is None   # 越界宁可不发
+
+
+def test_cache_control_requires_ttl_and_prefix(ah_plugin):
+    b = ah_plugin._builder
+    messages = [{"role": "system", "content": LONG_PREFIX}]
+    assert b.cache_control(messages, ttl_s=0) is None
+    assert b.cache_control(messages, ttl_s=None) is None
+    assert b.cache_control([], ttl_s=120) is None
+    assert b.cache_control("not-a-list", ttl_s=120) is None
+    # 前缀不足一个缓存块：不为不存在的东西声明保留
+    short = [{"role": "system", "content": "hi"}]
+    assert b.cache_control(short, ttl_s=120) is None
+
+
+def test_estimate_prefix_tokens_counts_cjk_per_character(ah_plugin):
+    b = ah_plugin._builder
+    assert b.estimate_prefix_tokens("会话一二三四") == 6
+    assert b.estimate_prefix_tokens("abcdefgh") == 2
+    assert b.estimate_prefix_tokens([{"content": "abcdefgh"}]) == 2
+
+
+# ---------------- _builder: manage requests ----------------
+
+@pytest.mark.parametrize("state,edit", [
+    ("pause", "offload"), ("resume", "prefetch"), ("stop", "evict"),
+])
+def test_build_manage_hint_maps_verb_to_edit(ah_plugin, state, edit):
+    b = ah_plugin._builder
+    hint = b.build_manage_hint(session_id="s1", call_index=3, epoch=2, state=state)
+    assert hint["session"] == {"session_id": "s1", "state": state, "call_index": 3, "epoch": 2}
+    cm = hint["context_management"]
+    assert cm["manage_request"] is True
+    # edits 只描述“对哪个会话做什么”：版本号属于 session 身份，两处都写会有两份真相
+    assert cm["edits"] == [{"type": edit, "target": "session"}]
+    assert "priority_control" not in hint and "cache_control" not in hint
+
+
+def test_compact_selects_evict_and_trims_the_epoch(ah_plugin):
+    hint = ah_plugin._builder.build_manage_hint(
+        session_id="s1", call_index=3, epoch=2, state="compact")
+    assert hint["session"] == {"session_id": "s1", "state": "compact",
+                               "call_index": 3, "epoch": 1}
+    assert hint["context_management"]["edits"] == [{"type": "evict", "target": "session"}]
+
+
+def test_compact_names_the_previous_epoch(ah_plugin):
+    """compact 描述刚被重写掉的那一代，所以 session.epoch 带 epoch - 1。"""
+    b = ah_plugin._builder
+    hint = b.build_manage_hint(session_id="s1", call_index=1, epoch=3, state="compact")
+    assert hint["session"]["epoch"] == 2
+    floor = b.build_manage_hint(session_id="s1", call_index=1, epoch=0, state="compact")
+    assert floor["session"]["epoch"] == 0  # 下限 0
+
+
+def test_build_manage_hint_refuses_ordinary_states(ah_plugin):
+    b = ah_plugin._builder
+    for state in ("start", "append"):
+        with pytest.raises(ValueError):
+            b.build_manage_hint(session_id="s1", call_index=1, epoch=0, state=state)
+
+
+def test_manage_body_is_a_placeholder(ah_plugin):
+    assert ah_plugin._builder.manage_body("m") == {"model": "m", "messages": [], "stream": False}
+    # 没配 model 就整段省略：空的 model 会被网关判为非法请求
+    assert ah_plugin._builder.manage_body("") == {"messages": [], "stream": False}
+
+
+# ---------------- _builder: TTL ----------------
+
+def test_estimate_ttl_s_follows_the_interval_doubling_rule(ah_plugin):
+    b = ah_plugin._builder
+    assert b.estimate_ttl_s(interval_ms=120_000) == 240   # 120s * 2
+    assert b.estimate_ttl_s(interval_ms=5_000) == 60      # 10s -> 抬到下限
     assert b.estimate_ttl_s() == 600                      # 默认 gap 300 * 2
-    assert b.estimate_ttl_s(tool_expected_duration_s=7200) == b.TTL_MAX_S  # 超上限 -> 截断到 3600
-    assert b.estimate_ttl_s(tool_expected_duration_s=0, interval_ms=0) == 600
+    assert b.estimate_ttl_s(interval_ms=7_200_000) == b.TTL_MAX_S  # 截断到 3600
+    assert b.estimate_ttl_s(interval_ms=0) == 600
 
 
 # ---------------- _state ----------------
 
 def test_call_index_starts_at_one(ah_plugin):
-    s = ah_plugin._state
-    assert s.note_call("s1", "r1")[0] == 1
+    assert ah_plugin._state.note_call("s1", "r1")[0] == 1
 
 
 def test_call_index_dedup_same_request_id(ah_plugin):
     s = ah_plugin._state
     assert s.note_call("s1", "r1")[0] == 1
     assert s.note_call("s1", "r1")[0] == 1  # 重试不涨
-    assert s.note_call("s1", "r2")[0] == 2  # 新调用涨
+    assert s.note_call("s1", "r2")[0] == 2
 
 
 def test_parallel_tools_gate_running(ah_plugin):
@@ -187,117 +271,79 @@ def test_parallel_tools_gate_running(ah_plugin):
     s.tool_started("s1", "c1")
     s.tool_started("s1", "c2")
     assert s.tool_finished("s1", "c1") is None  # 在飞未清空
-    assert s.tool_finished("s1", "c2") is not None  # 清空 -> running
+    assert s.tool_finished("s1", "c2") is not None
 
 
-def test_unknown_call_id_ignored(ah_plugin):
+def test_finalize_then_resume(ah_plugin):
     s = ah_plugin._state
-    s.tool_started("s1", "c1")
-    assert s.tool_finished("s1", "unknown") is None  # 未知 id 忽略，在飞仍非空
-    assert s.tool_finished("s1", "c1") is not None
+    s.set_state("s1", "finalize")
+    _ci, state, _since, _epoch, resumed = s.note_call("s1", "r9")
+    assert resumed is True
+    assert state == "running"
 
 
-def test_state_since_ms_updates_on_change_only(ah_plugin):
+def test_lineage_returns_parent_only(ah_plugin):
+    """derivation/child_role 已退役：子会话需要的只有“我爹是谁”。"""
     s = ah_plugin._state
-    first = s.set_state("s1", "running")
-    second = s.set_state("s1", "running")  # 无变化
-    assert first == second
-    third = s.set_state("s1", "tool")
-    assert third >= first  # 变化则更新时间戳
-
-
-def test_finalize_rides_one_request_then_back_to_running(ah_plugin):
-    """§4.4：跑完还有下一条请求时，那条请求头带 finalize，其后的请求才回 running。"""
-    s = ah_plugin._state
-    since = s.set_state("s1", "finalize")
-    _ci, state, got_since, _epoch, resumed = s.note_call("s1", "r9")
-    assert state == "finalize" and got_since == since and resumed is False
-    _ci, state, _since, _epoch, resumed = s.note_call("s1", "r10")
-    assert state == "running" and resumed is True  # 新一轮：中间件据此补发 running 事件
-
-
-def test_resume_rides_exactly_one_request(ah_plugin):
-    """§4.3：resume 只描述紧跟放行的那一条请求，其后立刻回 running。"""
-    s = ah_plugin._state
-    s.set_state("s1", "pause")
-    s.set_state("s1", "running")
-    released_at = s.mark_resume("s1")
-    _ci, state, since, _epoch, resumed = s.note_call("s1", "r1")
-    assert state == "resume"
-    assert since == released_at  # state_since_ms = 放行时刻，不是请求时刻
-    assert resumed is False
-    assert s.note_call("s1", "r2")[1] == "running"
-
-
-def test_retry_does_not_consume_one_shot(ah_plugin):
-    """同一 api_request_id 重试：结论原样返回，不二次消耗 resume 边。"""
-    s = ah_plugin._state
-    s.mark_resume("s1")
-    first = s.note_call("s1", "r1")
-    assert first[1] == "resume"
-    assert s.note_call("s1", "r1") == first
-    assert s.note_call("s1", "r2")[1] == "running"
-
-
-def test_new_pause_cancels_pending_resume(ah_plugin):
-    """上一轮的放行边还没被请求消费就再次挂起：新挂起覆盖旧放行。"""
-    s = ah_plugin._state
-    s.mark_resume("s1")
-    s.set_state("s1", "pause")
-    assert s.note_call("s1", "r1")[1] == "pause"
-
-
-def test_header_state_folds_internal_words(ah_plugin):
-    """§2.3 折叠：请求头只发四值，tool 折 running、suspend 折 pause；事件保留 tool。"""
-    b = ah_plugin._builder
-    assert b.header_state("running") == "running"
-    assert b.header_state("resume") == "resume"
-    assert b.header_state("tool") == "running"
-    assert b.header_state("suspend") == "pause"
-    assert b.header_state("checkpoint") == "pause"
-    assert b.header_state("不认识的词") == "running"
-    assert b.event_state("tool") == "tool"
-    assert b.event_state("suspend") == "pause"
-    hint = b.request_hint(session_id="s1", call_index=1, epoch=0, agent_type="t",
-                          state="tool", state_since_ms=1)
-    assert hint["agent_status"]["state"] == "running"
-    assert b.status_event("s1", "suspend", since_ms=1,
-                          reason="checkpoint")["agent_status"]["state"] == "pause"
-    assert b.status_event("s1", "tool", since_ms=1)["agent_status"]["state"] == "tool"
-
-
-def test_finalize_is_session_level(ah_plugin, tmp_path, monkeypatch):
-    """会话级 finalize 模式（finalize_on=session_finalize）：turn 结束（on_session_end）
-    不发 finalize，会话关闭（on_session_finalize）才发。默认模式见
-    test_middleware_header_follows_release_and_session_end。"""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
-    monkeypatch.setenv("AGENT_HINT_FINALIZE_ON", "session_finalize")
-    monkeypatch.setenv("AGENT_HINT_STATUS_SINK", "ndjson")
-    ah_plugin._settings._reset()
-    ah_plugin._sink._ndjson_path = None
-    ah_plugin._on_session_start(session_id="s1")
-    path = tmp_path / "agent-hint-events.ndjson"
-    assert len(path.read_text().strip().split("\n")) == 1, "only the opening running event so far"
-    ah_plugin._on_session_end(session_id="s1", completed=True)
-    assert len(path.read_text().strip().split("\n")) == 1, "a turn end must not emit finalize"
-    ah_plugin._on_session_finalize(session_id="s1")
-    lines = path.read_text().strip().split("\n")
-    assert len(lines) == 2
-    assert json.loads(lines[-1])["agent_status"]["state"] == "finalize", \
-        "only session close emits finalize, exactly once"
-
-
-def test_subagent_map_and_cleanup(ah_plugin):
-    s = ah_plugin._state
-    s.subagent_start("s-parent", "s-child", "leaf")
-    assert s.agent_type("s-child", "office-agent") == "leaf"
-    assert s.lineage("s-child") == ("s-parent", {"relation": "spawn", "join": "sync"})
+    assert s.lineage("s-child") is None
+    s.subagent_start("s-parent", "s-child")
+    assert s.lineage("s-child") == "s-parent"
     s.subagent_stop("s-child")
-    assert s.lineage("s-child") == (None, None)
-    # 空 child_session_id 防御跳过
-    s.subagent_start("s-parent", "", "leaf")
-    assert s.lineage("") == (None, None)
+    assert s.lineage("s-child") is None
+    s.subagent_start("s-parent", "")  # 空 child 防御跳过
+    assert s.lineage("") is None
+
+
+def test_peek_does_not_advance_anything(ah_plugin):
+    s = ah_plugin._state
+    assert s.peek("s1") == (0, 0, None)  # 未知会话不建条目
+    s.note_call("s1", "r1")
+    assert s.peek("s1")[0] == 1
+    assert s.peek("s1")[0] == 1  # 读不改
+
+
+def test_signature_change_is_detected_once(ah_plugin):
+    s = ah_plugin._state
+    assert s.note_signature("s1", "a") is False  # 第一次没有“上一轮”
+    assert s.note_signature("s1", "a") is False
+    assert s.note_signature("s1", "b") is True
+    assert s.note_signature("s1", "b") is False
+
+
+def test_rewrite_flag_is_consumed_once(ah_plugin):
+    s = ah_plugin._state
+    s.note_call("s1", "r1")
+    assert s.consume_rewrite("s1") is False
+    assert s.bump_epoch("s1") == 1
+    assert s.consume_rewrite("s1") is True
+    assert s.consume_rewrite("s1") is False
+    # 未见过的会话也要能抬代：压缩可能发生在第一条请求之前，只查不建会把那次重写弄丢。
+    assert s.bump_epoch("s-nonexistent") == 1
+    assert s.consume_rewrite("s-nonexistent") is True
+
+
+def test_drop_and_lru_purge_subagent_refs(ah_plugin):
+    s = ah_plugin._state
+    s.subagent_start("p0", "c0")
+    assert "c0" in s._subagent
+    for i in range(s._MAX_SESSIONS):
+        s.note_call("s%d" % i, "r")
+    assert "c0" not in s._subagent  # LRU 淘汰一并清父映射
+    s.subagent_start("p1", "c1")
+    s.drop("c1")
+    assert "c1" not in s._subagent
+
+
+def test_epoch_provider_seam(ah_plugin):
+    s = ah_plugin._state
+    assert s.note_call("s1", "r1")[3] == 0
+    assert s.bump_epoch("s1") == 1
+    assert s.note_call("s1", "r2")[3] == 1
+    s.set_epoch_provider(lambda _sid: 42)
+    assert s.note_call("s1", "r3")[3] == 42
+    s.set_epoch_provider(lambda _sid: 1 / 0)  # provider 异常回退内部计数器
+    assert s.note_call("s1", "r4")[3] == 1
+    s.set_epoch_provider(None)
 
 
 # ---------------- _stats ----------------
@@ -308,265 +354,28 @@ def test_collect_then_snapshot(ah_plugin):
                api_duration=0.5, first_chunk_at=100.0, started_at=99.5, ended_at=100.5)
     snap = st.snapshot("s1")
     assert snap["output_tokens"] == 20
-    assert snap["latency_ms"] == 500  # (100.0 - 99.5) * 1000
-    # 未配置 next_action_map -> next_action/remaining_calls 整段省略（不猜）
-    assert "next_action" not in snap
-    assert "remaining_calls" not in snap
+    assert snap["latency_ms"] == 500
+    assert "interval_ms" in snap  # 上一次结束到现在
+    assert "next_action" not in snap and "remaining_calls" not in snap  # prediction 已退役
 
 
 def test_usage_none_skipped(ah_plugin):
     st = ah_plugin._stats
     st.collect(session_id="s1", usage=None, api_duration=1.0)
-    assert st.snapshot("s1") is None  # 空样本不产出 prediction
+    assert st.snapshot("s1") is None
+    assert st.interval_ms("s1") is None
 
 
-def test_no_samples_snapshot_none(ah_plugin):
-    assert ah_plugin._stats.snapshot("s-nope") is None
-
-
-def test_next_action_map_generic(ah_plugin):
-    """next_action/remaining_calls 由通用映射驱动（不再硬编码任何业务 SOP）。"""
+def test_interval_only_sample(ah_plugin):
+    """只有结束时刻也能给出间隔：TTL 推导不依赖 usage。"""
     st = ah_plugin._stats
-    mapping = {
-        "step_a_": ["step_b_run", 8, "tool"],
-        "step_b_": [None, 0, "finalize"],
-        "__default__": ["step_a_go", 10, "tool"],
-    }
-    st.collect(session_id="s1", usage={"output_tokens": 5}, ended_at=100.0)
-    st.note_tool("s1", "step_a_go")
-    snap = st.snapshot("s1", next_action_map=mapping)
-    assert snap["next_action"]["tools"][0]["name"] == "step_b_run"
-    assert snap["next_action"]["prob"] == 0.5
-    assert snap["remaining_calls"] == 8
-    st.note_tool("s1", "step_b_run")
-    assert st.snapshot("s1", next_action_map=mapping)["next_action"]["state"] == "finalize"
-    # 未知工具名 -> 走 __default__ 兜底
-    st.note_tool("s1", "whatever_x")
-    assert st.snapshot("s1", next_action_map=mapping)["next_action"]["tools"][0]["name"] == "step_a_go"
-    # 无 __default__ 且不匹配 -> 整段省略
-    st.note_tool("s1", "unknown_zzz")
-    snap2 = st.snapshot("s1", next_action_map={"step_a_": ["step_b_run", 8, "tool"]})
-    assert "next_action" not in snap2
+    st.collect(session_id="s1", usage=None, ended_at=0.0)  # usage None -> 不记样本
+    assert st.interval_ms("s1") is None
+    st.collect(session_id="s1", usage={"output_tokens": 1}, ended_at=0.0)
+    assert st.interval_ms("s1") is not None
 
-
-def test_next_action_map_dict_entry_and_longest_prefix(ah_plugin):
-    st = ah_plugin._stats
-    st.collect(session_id="s2", usage={"output_tokens": 1}, ended_at=1.0)
-    st.note_tool("s2", "web_search_long")
-    snap = st.snapshot("s2", next_action_map={
-        "web_": {"tool": "wrong", "remaining": 1, "state": "tool"},
-        "web_search_long": {"tool": "next_tool", "remaining": 2, "state": "tool"},
-    })
-    assert snap["next_action"]["tools"][0]["name"] == "next_tool"
-    assert snap["remaining_calls"] == 2
-
-
-# ---------------- _settings ----------------
-
-def test_settings_precedence(ah_plugin, monkeypatch):
-    s = ah_plugin._settings
-    monkeypatch.setenv("AGENT_HINT_AGENT_TYPE", "from-env")
-    s.bind(_FakeCtx({"agent_type": "from-settings"}))
-    assert s.agent_type() == "from-settings"  # settings > env
-
-
-def test_settings_env_over_default(ah_plugin, monkeypatch):
-    s = ah_plugin._settings
-    monkeypatch.setenv("AGENT_HINT_AGENT_TYPE", "from-env")
-    s._reset()
-    assert s.agent_type() == "from-env"
-    monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
-    s._reset()
-    assert s.enabled() is True
-
-
-def test_priority_zero_or_empty_omitted(ah_plugin, monkeypatch):
-    s = ah_plugin._settings
-    monkeypatch.setenv("AGENT_HINT_PRIORITY_LEVEL", "0")
-    s._reset()
-    assert s.priority() is None
-    monkeypatch.setenv("AGENT_HINT_PRIORITY_LEVEL", "")
-    s._reset()
-    assert s.priority() is None
-    monkeypatch.setenv("AGENT_HINT_PRIORITY_LEVEL", "3")
-    monkeypatch.setenv("AGENT_HINT_PRIORITY_REASON", "critical_path")
-    s._reset()
-    assert s.priority() == {"level": 3, "reason": "critical_path"}
-
-
-def test_status_sink_defaults(ah_plugin, monkeypatch):
-    s = ah_plugin._settings
-    monkeypatch.delenv("AGENT_HINT_STATUS_SINK", raising=False)
-    monkeypatch.delenv("AGENT_HINT_STATUS_URL", raising=False)
-    s._reset()
-    assert s.status_sink() == "none"
-    monkeypatch.setenv("AGENT_HINT_STATUS_URL", "http://x")
-    s._reset()
-    assert s.status_sink() == "http"
-    monkeypatch.setenv("AGENT_HINT_STATUS_SINK", "ndjson")
-    s._reset()
-    assert s.status_sink() == "ndjson"
-
-
-def test_suspend_and_cache_pin_parse(ah_plugin, monkeypatch):
-    s = ah_plugin._settings
-    monkeypatch.setenv("AGENT_HINT_SUSPEND_AFTER_S", "120")
-    monkeypatch.setenv("AGENT_HINT_CACHE_PIN_END", "3")
-    s._reset()
-    assert s.suspend_after_s() == 120
-    assert s.cache_pin_end() == 3
-    monkeypatch.setenv("AGENT_HINT_SUSPEND_AFTER_S", "-5")
-    s._reset()
-    assert s.suspend_after_s() == 0  # 负数钳为 0
-
-
-# ---------------- _sink ----------------
-
-def test_ndjson_append(tmp_path, ah_plugin, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("AGENT_HINT_STATUS_SINK", "ndjson")
-    ah_plugin._settings._reset()
-    ah_plugin._sink._ndjson_path = None
-    ah_plugin._sink.emit({"session": {"session_id": "s1"},
-                          "agent_status": {"state": "running", "state_since_ms": 1}})
-    ah_plugin._sink.emit({"session": {"session_id": "s1"},
-                          "agent_status": {"state": "finalize", "state_since_ms": 2}})
-    lines = (tmp_path / "agent-hint-events.ndjson").read_text().strip().split("\n")
-    assert len(lines) == 2
-    assert json.loads(lines[0])["agent_status"]["state"] == "running"
-    assert json.loads(lines[1])["agent_status"]["state"] == "finalize"
-
-
-def test_sink_never_raises(ah_plugin, monkeypatch):
-    monkeypatch.setenv("AGENT_HINT_STATUS_SINK", "ndjson")
-    ah_plugin._settings._reset()
-    ah_plugin._sink._ndjson_path = None
-    # 强制写入失败：monkeypatch open 抛 IOError -> emit 吞掉不抛
-    import builtins
-    real_open = builtins.open
-
-    def _boom(*a, **k):
-        raise IOError("disk full")
-
-    monkeypatch.setattr(builtins, "open", _boom)
-    ah_plugin._sink.emit({"session": {"session_id": "s1"},
-                          "agent_status": {"state": "running", "state_since_ms": 1}})
-    monkeypatch.setattr(builtins, "open", real_open)
-
-
-# ---------------- middleware / hooks ----------------
-
-def test_middleware_injects_header_cow(ah_plugin, monkeypatch):
-    monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
-    ah_plugin._settings._reset()
-    req = {"model": "x", "messages": [{"role": "system"}, {"role": "user", "content": LONG_PREFIX}]}
-    result = ah_plugin._on_llm_request(request=req, session_id="s1", api_request_id="r1")
-    assert result is not None
-    assert result["request"] is not req  # COW
-    assert req.get("extra_headers") is None  # 不改入参
-    hint = ah_plugin._codec.decode(result["request"]["extra_headers"]["X-Agent-Hint"])
-    assert hint["session"]["call_index"] == 1
-    assert hint["agent_status"]["state"] == "running"
-    # 默认 auto：没有可用的运行时信号时按协议默认 gap（300s * 2）声明保留窗口；
-    # pin 已退役，只发一条 ephemeral。
-    assert hint["cache_control"] == [
-        # 断点默认 auto：落在当前逻辑输入末尾（system + user = 2），不再只护 system 那条
-        {"type": "ephemeral", "ttl_s": 600, "range": {"end": 2, "unit": "message"}},
-    ]
-
-
-def test_middleware_header_follows_release_and_session_end(ah_plugin, monkeypatch):
-    """走真实 hooks：放行后第一条请求头 resume，会话结束后第一条请求头 finalize。"""
-    monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
-    ah_plugin._settings._reset()
-    req = {"model": "x", "messages": [{"role": "system"}, {"role": "user", "content": LONG_PREFIX}]}
-
-    def _state_of(api_request_id):
-        out = ah_plugin._on_llm_request(request=dict(req), session_id="s1",
-                                        api_request_id=api_request_id)
-        hint = ah_plugin._codec.decode(out["request"]["extra_headers"]["X-Agent-Hint"])
-        return hint["agent_status"]["state"]
-
-    ah_plugin._on_session_start(session_id="s1")
-    assert _state_of("r1") == "running"
-    ah_plugin._on_pre_approval_request(session_id="s1", session_key="s1")
-    assert _state_of("r2") == "pause"
-    ah_plugin._on_post_approval_response(session_id="s1", session_key="s1")
-    assert _state_of("r3") == "resume"      # 紧跟放行的那一条
-    assert _state_of("r4") == "running"     # 其后回默认
-    ah_plugin._on_session_end(session_id="s1", completed=True)
-    assert _state_of("r5") == "finalize"    # 结束之后还有请求 -> 那条带 finalize
-    assert _state_of("r6") == "running"     # 新一轮
-
-
-def test_middleware_request_not_dict(ah_plugin, monkeypatch):
-    monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
-    ah_plugin._settings._reset()
-    assert ah_plugin._on_llm_request(request="not-a-dict", session_id="s1") is None
-    assert ah_plugin._on_llm_request(request={}, session_id="") is None
-
-
-def test_middleware_aux_request_bare(ah_plugin, monkeypatch):
-    """辅助请求（压缩摘要 / 会话标题）整段豁免（RFC §1.3 / §3.3.5）。
-
-    宿主在中间件调用点声明：``auxiliary=1`` 或 ``purpose`` 属辅助类。插件原样
-    放行——不带 hint、不推进 call_index；被豁免的调用不占用序号。
-    """
-    monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
-    ah_plugin._settings._reset()
-    req = {"model": "x", "messages": [{"role": "user", "content": "summarize"}]}
-    # auxiliary 显式声明
-    out = ah_plugin._on_llm_request(request=req, session_id="s1",
-                                    api_request_id="r1", auxiliary=True)
-    assert out is None
-    assert "extra_headers" not in req          # 入参原样，未被动过
-    # purpose 声明（大小写不敏感）
-    for purpose in ("compaction", "Summarization", "title"):
-        out = ah_plugin._on_llm_request(request=dict(req), session_id="s1",
-                                        api_request_id="r2", purpose=purpose)
-        assert out is None, purpose
-    # 非辅助 purpose 不豁免：同一条请求照常装饰，且 call_index 从 1 起
-    # （前面被豁免的三次调用没有推进序号）
-    out = ah_plugin._on_llm_request(request=dict(req), session_id="s1",
-                                    api_request_id="r3", purpose="chat")
-    hint = ah_plugin._codec.decode(out["request"]["extra_headers"]["X-Agent-Hint"])
-    assert hint["session"]["call_index"] == 1
-
-
-def test_pre_tool_call_returns_none(ah_plugin, monkeypatch):
-    monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
-    ah_plugin._settings._reset()
-    assert ah_plugin._on_pre_tool_call(session_id="s1", tool_name="research_web_search",
-                                       tool_call_id="c1") is None  # 绝不干预
-
-
-def test_hooks_disabled_early_return(ah_plugin, monkeypatch, tmp_path):
-    monkeypatch.setenv("AGENT_HINT_ENABLED", "0")
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("AGENT_HINT_STATUS_SINK", "ndjson")
-    ah_plugin._settings._reset()
-    ah_plugin._sink._ndjson_path = None
-    ah_plugin._on_session_start(session_id="s1")
-    ah_plugin._on_pre_tool_call(session_id="s1", tool_name="t", tool_call_id="c")
-    assert not (tmp_path / "agent-hint-events.ndjson").exists()  # 关闭态零事件
-
-
-def test_subagent_hint_via_middleware(ah_plugin, monkeypatch):
-    monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
-    ah_plugin._settings._reset()
-    ah_plugin._state.subagent_start("s-parent", "s-child", "leaf")
-    result = ah_plugin._on_llm_request(
-        request={"messages": [{"role": "system"}]}, session_id="s-child", api_request_id="r1")
-    hint = ah_plugin._codec.decode(result["request"]["extra_headers"]["X-Agent-Hint"])
-    assert hint["session"]["parent_session_id"] == "s-parent"
-    assert hint["session"]["derivation"] == {"relation": "spawn", "join": "sync"}
-    assert hint["session"]["agent_type"] == "leaf"
-
-
-# ---------------- review 补强：锁 / subagent 清理 / epoch 接缝 ----------------
 
 def test_stats_snapshot_thread_safe(ah_plugin):
-    """review A1：snapshot 与 collect 并发不得抛（deque 迭代竞态）。"""
     import threading
     st = ah_plugin._stats
     caught = []
@@ -577,7 +386,7 @@ def test_stats_snapshot_thread_safe(ah_plugin):
                        api_duration=0.001, started_at=0.0, first_chunk_at=0.001, ended_at=0.002)
             try:
                 st.snapshot("s%d" % (base % 4))
-            except Exception as ex:  # 断言有错才走
+            except Exception as ex:
                 caught.append(ex)
 
     threads = [threading.Thread(target=_worker, args=(i,)) for i in range(8)]
@@ -586,323 +395,418 @@ def test_stats_snapshot_thread_safe(ah_plugin):
     for t in threads:
         t.join()
     assert not caught, "snapshot 并发下不应抛异常: %r" % caught
-    assert st.snapshot("s0") is not None
 
 
-def test_subagent_drop_purges_own_ref(ah_plugin):
-    """review A2：未走 subagent_stop 直接 drop(child) 也应清 child 自身父映射。"""
-    s = ah_plugin._state
-    s.subagent_start("s-parent", "s-child", "leaf")
-    assert s.lineage("s-child")[0] == "s-parent"
-    s.subagent_stop("s-child")  # 正常路径
-    assert s.lineage("s-child") == (None, None)
-    # 中断/异常路径：直接 drop(child)
-    s.subagent_start("s-parent", "s-child2", "leaf")
-    s.drop("s-child2")
-    assert s.lineage("s-child2") == (None, None)
-    assert "s-child2" not in s._subagent
+# ---------------- _settings ----------------
 
-
-def test_subagent_lru_eviction_purges_ref(ah_plugin):
-    """review A2：LRU 淘汰会话时一并清理其 _subagent 父映射。"""
-    s = ah_plugin._state
-    s.subagent_start("p0", "c0", "leaf")  # 建 c0 会话（最旧）+ 父映射
-    assert "c0" in s._subagent
-    for i in range(s._MAX_SESSIONS):
-        s.note_call("s%d" % i, "r")  # 填满触发 c0 淘汰
-    assert "c0" not in s._subagent  # 随 LRU 一并清理
-
-
-def test_epoch_counter_and_provider_seam(ah_plugin):
-    """review B：epoch 计数器 + epoch_provider 接缝（默认恒 0）。"""
-    s = ah_plugin._state
-    assert s.note_call("s1", "r1")[3] == 0        # 默认内部计数器恒 0
-    assert s.bump_epoch("s1") == 1                # 计数器递增（接缝）
-    assert s.note_call("s1", "r2")[3] == 1
-    s.set_epoch_provider(lambda _sid: 42)         # provider 接缝覆盖
-    assert s.note_call("s1", "r3")[3] == 42
-    s.set_epoch_provider(lambda _sid: 1 / 0)      # provider 异常 -> 回退内部计数器
-    assert s.note_call("s1", "r4")[3] == 1
-    s.set_epoch_provider(None)                    # 恢复内部计数器
-    assert s.note_call("s1", "r5")[3] == 1
-    assert s.bump_epoch("s-nonexistent") == 1     # 0.10.0 起未知会话也抬代（压缩可能早于首条请求）
-
-
-def test_priority_folds_onto_the_two_level_contract(ah_plugin, monkeypatch):
-    """priority.level 只保留 {1, 3}：消费侧只跟一条准入线比较。
-
-    v1 遗留的 2/4 折叠后仍落在原来那一侧（2 → 1、4 → 3），越界值同理；
-    reason 原样保留，用来承载真正丰富的语义。
-    """
+def test_settings_precedence(ah_plugin, monkeypatch):
     s = ah_plugin._settings
-    for configured, expected in (("1", 1), ("2", 1), ("3", 3), ("4", 3), ("90", 3), ("7", 3)):
-        monkeypatch.setenv("AGENT_HINT_PRIORITY_LEVEL", configured)
-        monkeypatch.setenv("AGENT_HINT_PRIORITY_REASON", "critical_path")
-        s._reset()
-        assert s.priority() == {"level": expected, "reason": "critical_path"}, configured
+    monkeypatch.setenv("AGENT_HINT_MANAGE_MODEL", "from-env")
+    s.bind(_FakeCtx({"manage_model": "from-settings"}))
+    assert s.manage_model() == "from-settings"
 
 
-def test_priority_reason_folds_onto_the_rfc_vocab(ah_plugin, monkeypatch):
-    """reason 出口必须落在 RFC 词表 {user_waiting, critical_path, background}。
-
-    词表外的取值在消费侧没有语义（拿它做准入判断只会失配）：冒号前缀命中词表的
-    取前缀（``background: context_compaction`` → ``background``），完全词表外的按
-    档位兜底——免排队档必然有人在等，背景档一律 background。
-    """
+def test_settings_env_over_default(ah_plugin, monkeypatch):
     s = ah_plugin._settings
-    cases = [
-        ("background: context_compaction", "1", 1, "background"),
-        ("background: context_compaction", "3", 3, "background"),
-        ("continuation: tool_followup", "2", 1, "background"),
-        ("CRITICAL_PATH: retry", "3", 3, "critical_path"),
-        ("totally-custom-reason", "3", 3, "user_waiting"),
-        ("totally-custom-reason", "1", 1, "background"),
-        ("", "3", 3, "user_waiting"),
-        ("", "1", 1, "background"),
-    ]
-    for raw, level, folded, reason in cases:
-        monkeypatch.setenv("AGENT_HINT_PRIORITY_LEVEL", level)
-        monkeypatch.setenv("AGENT_HINT_PRIORITY_REASON", raw)
-        s._reset()
-        assert s.priority() == {"level": folded, "reason": reason}, (raw, level)
+    monkeypatch.setenv("AGENT_HINT_MANAGE_MODEL", "from-env")
+    s._reset()
+    assert s.manage_model() == "from-env"
+    assert s.enabled() is False
+    monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
+    s._reset()
+    assert s.enabled() is True
 
-def test_cache_pin_end_defaults_to_the_end_of_the_logical_input(ah_plugin, monkeypatch):
-    """断点默认落在当前逻辑输入末尾，不再只护住 system 那一条。"""
+
+def test_retired_settings_are_gone(ah_plugin):
+    """退役键不再被读取：旧配置留着也不会悄悄改变行为。"""
+    for key in ("agent_type", "status_sink", "status_url", "finalize_on",
+                "suspend_after_s", "next_action_map", "cache_task_end", "priority_reason"):
+        assert key not in ah_plugin._settings._DEFAULTS, key
+
+
+def test_priority_level_zero_or_empty_omitted(ah_plugin, monkeypatch):
+    s = ah_plugin._settings
+    for raw in ("0", "", "-3", "abc"):
+        monkeypatch.setenv("AGENT_HINT_PRIORITY_LEVEL", raw)
+        s._reset()
+        assert s.priority_level() is None, raw
+    monkeypatch.setenv("AGENT_HINT_PRIORITY_LEVEL", "3")
+    s._reset()
+    assert s.priority_level() == 3
+
+
+def test_cache_ttl_distinguishes_auto_none_and_fixed(ah_plugin, monkeypatch):
+    s = ah_plugin._settings
+    for raw in ("", "auto", "none", "null"):
+        monkeypatch.setenv("AGENT_HINT_CACHE_TTL_S", raw)
+        s._reset()
+        assert s.cache_ttl_s() is None, raw
+    for raw in ("0", "59", "3601", "-5", "abc"):
+        monkeypatch.setenv("AGENT_HINT_CACHE_TTL_S", raw)
+        s._reset()
+        assert s.cache_ttl_s() == 0, raw
+    monkeypatch.setenv("AGENT_HINT_CACHE_TTL_S", "120")
+    s._reset()
+    assert s.cache_ttl_s() == 120
+
+
+def test_cache_pin_end_parsing(ah_plugin, monkeypatch):
     s = ah_plugin._settings
     monkeypatch.delenv("AGENT_HINT_CACHE_PIN_END", raising=False)
     s._reset()
     assert s.cache_pin_end() is None  # None = auto
-
-    monkeypatch.setenv("AGENT_HINT_CACHE_PIN_END", "auto")
-    s._reset()
-    assert s.cache_pin_end() is None
-
+    for raw in ("auto", ""):
+        monkeypatch.setenv("AGENT_HINT_CACHE_PIN_END", raw)
+        s._reset()
+        assert s.cache_pin_end() is None, raw
     monkeypatch.setenv("AGENT_HINT_CACHE_PIN_END", "0")
     s._reset()
     assert s.cache_pin_end() == 0
-
     monkeypatch.setenv("AGENT_HINT_CACHE_PIN_END", "3")
     s._reset()
     assert s.cache_pin_end() == 3
 
 
-def test_emitted_breakpoint_covers_the_whole_input(ah_plugin, monkeypatch):
-    """发出去的 range.end 等于消息条数（含 system），与 Pi 一致。"""
-    monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
-    monkeypatch.delenv("AGENT_HINT_CACHE_PIN_END", raising=False)
-    monkeypatch.delenv("AGENT_HINT_CACHE_TASK_END", raising=False)
+def test_manage_sink_defaults_and_overrides(ah_plugin, monkeypatch):
+    s = ah_plugin._settings
+    for key in ("AGENT_HINT_MANAGE_SINK", "AGENT_HINT_MANAGE_URL"):
+        monkeypatch.delenv(key, raising=False)
+    s._reset()
+    assert s.manage_sink() == "none"
+    monkeypatch.setenv("AGENT_HINT_MANAGE_URL", "http://x/v1/chat/completions")
+    s._reset()
+    assert s.manage_sink() == "http"
+    monkeypatch.setenv("AGENT_HINT_MANAGE_SINK", "ndjson")
+    s._reset()
+    assert s.manage_sink() == "ndjson"
+
+
+def test_manage_clamps(ah_plugin, monkeypatch):
+    s = ah_plugin._settings
+    monkeypatch.setenv("AGENT_HINT_MANAGE_TIMEOUT_S", "999")
+    monkeypatch.setenv("AGENT_HINT_MANAGE_MAX_RETRIES", "99")
+    monkeypatch.setenv("AGENT_HINT_MANAGE_QUEUE_LIMIT", "0")
+    s._reset()
+    assert s.manage_timeout_s() == 30
+    assert s.manage_max_retries() == 3
+    assert s.manage_queue_limit() == 1
+
+
+def test_manage_token_reads_the_named_env(ah_plugin, monkeypatch):
+    s = ah_plugin._settings
+    monkeypatch.delenv("AGENT_HINT_TOKEN", raising=False)
+    s._reset()
+    assert s.manage_token() == ""
+    monkeypatch.setenv("AGENT_HINT_TOKEN", "tok")
+    s._reset()
+    assert s.manage_token() == "tok"
+    monkeypatch.setenv("AGENT_HINT_MANAGE_TOKEN_ENV", "OTHER_TOKEN")
+    monkeypatch.setenv("OTHER_TOKEN", "tok2")
+    s._reset()
+    assert s.manage_token() == "tok2"
+
+
+# ---------------- _sink ----------------
+
+def _manage_lines(tmp_path):
+    path = tmp_path / "agent-hint-manage.ndjson"
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().strip().split("\n")]
+
+
+def _pause_hint(ah_plugin, epoch=0, call_index=2):
+    return ah_plugin._builder.build_manage_hint(
+        session_id="s1", call_index=call_index, epoch=epoch, state="pause")
+
+
+def test_ndjson_records_the_manage_request(tmp_path, ah_plugin, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("AGENT_HINT_MANAGE_SINK", "ndjson")
+    monkeypatch.setenv("AGENT_HINT_MANAGE_MODEL", "m")
+    monkeypatch.setenv("AGENT_HINT_TOKEN", "secret-token")
     ah_plugin._settings._reset()
+    assert ah_plugin._sink.dispatch(_pause_hint(ah_plugin)) is True
+    records = _manage_lines(tmp_path)
+    assert len(records) == 1
+    record = records[0]
+    assert record["hint"]["session"]["state"] == "pause"
+    assert record["body"] == {"model": "m", "messages": [], "stream": False}
+    assert record["headers"]["Authorization"] == "Bearer secret-token"
+    # token 只进 header，绝不进 hint（hint 会随请求落到引擎日志里）
+    assert "secret-token" not in json.dumps(record["hint"])
 
-    hooks, mw = {}, {}
 
-    class _C:
-        def register_hook(self, name, cb):
-            hooks[name] = cb
+def test_sink_none_sends_nothing(tmp_path, ah_plugin, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("AGENT_HINT_MANAGE_SINK", "none")
+    ah_plugin._settings._reset()
+    assert ah_plugin._sink.dispatch(_pause_hint(ah_plugin)) is False
+    assert _manage_lines(tmp_path) == []
 
-        def register_middleware(self, name, cb):
-            mw[name] = cb
 
-    ah_plugin.register(_C())
-    req = {"model": "m", "messages": [
-        {"role": "system", "content": "sys " + "x " * 400},
-        {"role": "user", "content": "hello " + "y " * 200},
-        {"role": "assistant", "content": "hi"},
+def test_consecutive_identical_verbs_are_deduped(tmp_path, ah_plugin, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("AGENT_HINT_MANAGE_SINK", "ndjson")
+    ah_plugin._settings._reset()
+    _sink = ah_plugin._sink
+    _b = ah_plugin._builder
+    assert _sink.dispatch(_b.build_manage_hint(session_id="s1", call_index=1, epoch=0, state="pause"))
+    assert not _sink.dispatch(_b.build_manage_hint(session_id="s1", call_index=1, epoch=0, state="pause"))
+    assert _sink.dispatch(_b.build_manage_hint(session_id="s1", call_index=1, epoch=0, state="resume"))
+    assert _sink.dispatch(_b.build_manage_hint(session_id="s1", call_index=1, epoch=0, state="pause"))
+    assert len(_manage_lines(tmp_path)) == 3  # pause / resume / pause
+
+
+def test_sink_never_raises(ah_plugin, monkeypatch):
+    monkeypatch.setenv("AGENT_HINT_MANAGE_SINK", "ndjson")
+    ah_plugin._settings._reset()
+    ah_plugin._sink._ndjson_path = None
+    import builtins
+    real_open = builtins.open
+
+    def _boom(*a, **k):
+        raise IOError("disk full")
+
+    monkeypatch.setattr(builtins, "open", _boom)
+    ah_plugin._sink.dispatch(_pause_hint(ah_plugin))  # 吞掉，不抛
+    monkeypatch.setattr(builtins, "open", real_open)
+
+
+def test_dispatch_ignores_malformed_hint(ah_plugin, monkeypatch):
+    monkeypatch.setenv("AGENT_HINT_MANAGE_SINK", "ndjson")
+    ah_plugin._settings._reset()
+    assert ah_plugin._sink.dispatch({}) is False
+    assert ah_plugin._sink.dispatch({"session": {"session_id": "s1"}}) is False
+
+
+# ---------------- middleware ----------------
+
+def _request(messages=None, model="mock", tools=None):
+    body = {"model": model, "messages": messages or [
+        {"role": "system", "content": "sys " + LONG_PREFIX},
+        {"role": "user", "content": "hello"},
     ]}
-    out = mw["llm_request"](request=req, session_id="s-end", api_request_id="r-1")
-    raw = (out.get("request") or {}).get("extra_headers", {}).get("X-Agent-Hint")
-    import base64 as _b64
-    import json as _json
-    hint = _json.loads(_b64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode())
-    assert hint["cache_control"][0]["range"]["end"] == 3
-
-def test_declared_fork_lineage_is_published(ah_plugin, monkeypatch):
-    """Hermes 原生只有 spawn；fork 由部署方声明。"""
-    monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
-    monkeypatch.setenv("AGENT_HINT_LINEAGE",
-                       '{"relation":"fork","parent_session_id":"s-root","fork_point":7}')
-    ah_plugin._settings._reset()
-
-    lineage = ah_plugin._settings.lineage()
-    assert lineage == {"relation": "fork", "parent_session_id": "s-root", "fork_point": 7}
-
-    class _C:
-        def register_hook(self, name, cb):
-            pass
-
-        def register_middleware(self, name, cb):
-            pass
-
-    ah_plugin.register(_C())
-    parent, derivation = ah_plugin._state.lineage("s-child")
-    assert parent == "s-root"
-    assert derivation == {"relation": "fork", "fork_point": 7}
+    if tools is not None:
+        body["tools"] = tools
+    return body
 
 
-def test_native_subagent_wins_over_declared_lineage(ah_plugin, monkeypatch):
-    """子 agent 的原生 spawn 优先于配置声明。"""
-    monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
-    monkeypatch.setenv("AGENT_HINT_LINEAGE",
-                       '{"relation":"fork","parent_session_id":"s-root","fork_point":1}')
-    ah_plugin._settings._reset()
-    ah_plugin._state.subagent_start("s-parent", "s-sub", "worker")
-    parent, derivation = ah_plugin._state.lineage("s-sub")
-    assert parent == "s-parent"
-    assert derivation == {"relation": "spawn", "join": "sync"}
-
-
-def test_declared_lineage_is_ignored_when_malformed(ah_plugin, monkeypatch):
-    monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
-    monkeypatch.setenv("AGENT_HINT_LINEAGE", '{"relation":"adopted"}')
-    ah_plugin._settings._reset()
-    assert ah_plugin._settings.lineage() is None
-    assert ah_plugin._state.lineage("s-root") == (None, None)
-
-def test_resume_state_is_reported_once_after_approval(ah_plugin, monkeypatch):
-    """被放行的这一条请求报 resume，之后回到 running。"""
+def test_middleware_injects_four_blocks_without_touching_the_body(ah_plugin, monkeypatch):
     monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
     ah_plugin._settings._reset()
+    req = _request()
+    result = ah_plugin._on_llm_request(request=req, session_id="s1", api_request_id="r1")
+    assert result is not None
+    assert result["request"] is not req        # COW
+    assert req.get("extra_headers") is None    # 入参未被改
+    assert "agent_hint" not in result["request"]  # 零字段进 body
 
-    mw = {}
-    class _C:
-        def register_hook(self, name, cb):
-            pass
-
-        def register_middleware(self, name, cb):
-            mw[name] = cb
-
-    ah_plugin.register(_C())
-    ah_plugin._on_pre_approval_request(session_id="s-res", kind="approval")
-    ah_plugin._on_post_approval_response(session_id="s-res", choice="once")
-
-    req = {"model": "m", "messages": [
-        {"role": "system", "content": "sys " + "x " * 400},
-        {"role": "user", "content": "hi"}]}
-    out = mw["llm_request"](request=req, session_id="s-res", api_request_id="r-1")
-    hint = ah_plugin._codec.decode(out["request"]["extra_headers"]["X-Agent-Hint"])
-    assert hint["agent_status"]["state"] == "resume"
-
-    out2 = mw["llm_request"](request=req, session_id="s-res", api_request_id="r-2")
-    hint2 = ah_plugin._codec.decode(out2["request"]["extra_headers"]["X-Agent-Hint"])
-    assert hint2["agent_status"]["state"] == "running"
+    hint = _decode_headers(result)
+    assert hint["session"] == {"session_id": "s1", "state": "start",
+                               "call_index": 1, "epoch": 0}
+    assert hint["priority_control"] == {"priority": {"level": 3, "reason": "user_waiting"}}
+    assert hint["cache_control"]["msg_offset"] == 2
+    assert hint["cache_control"]["ttl_s"] == 600  # 无观测 -> 默认 gap 300 * 2
+    for name in RETIRED_BLOCKS:
+        assert name not in hint, name
 
 
-def test_epoch_bumps_when_the_context_shrinks(ah_plugin, monkeypatch):
-    """0.7.1 起不再从消息条数回落嗅探压缩（宿主才知道压缩真发生没）：
-    宿主在真实压缩后调 `_state.bump_epoch()`，每压缩一次 epoch +1。"""
+def test_middleware_start_once_then_append(ah_plugin, monkeypatch):
     monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
     ah_plugin._settings._reset()
-    mw = {}
-    class _C:
-        def register_hook(self, name, cb):
-            pass
+    first = _decode_headers(ah_plugin._on_llm_request(
+        request=_request(), session_id="s1", api_request_id="r1"))
+    second = _decode_headers(ah_plugin._on_llm_request(
+        request=_request(), session_id="s1", api_request_id="r2"))
+    assert (first["session"]["state"], first["session"]["call_index"]) == ("start", 1)
+    assert (second["session"]["state"], second["session"]["call_index"]) == ("append", 2)
 
-        def register_middleware(self, name, cb):
-            mw[name] = cb
 
-    ah_plugin.register(_C())
-
-    def emitted_epoch(api_id):
-        req = {"model": "m", "messages": [
-            {"role": "system", "content": "sys " + "x" * 400},
-            {"role": "user", "content": "hi"}]}
-        out = mw["llm_request"](request=req, session_id="s-epoch", api_request_id=api_id)
-        return ah_plugin._codec.decode(out["request"]["extra_headers"]["X-Agent-Hint"])["session"]["epoch"]
-
-    assert emitted_epoch("r-1") == 0   # 没压缩过
-    ah_plugin._state.bump_epoch("s-epoch")
-    assert emitted_epoch("r-2") == 1   # 压缩一次
-    ah_plugin._state.bump_epoch("s-epoch")
-    assert emitted_epoch("r-3") == 2   # 再压缩一次
-def test_approval_release_emits_one_resume_event(ah_plugin, monkeypatch):
-    """事件通道与请求头同一套四值：放行的一次性边在事件里也只报一条 resume。
-
-    2026-11-07 规格裁定：事件词表含 resume（不再折成 running）；同一条边只报一次，
-    且 state_since_ms 与请求头同一时刻。
-    """
+def test_middleware_retry_keeps_the_same_call_index(ah_plugin, monkeypatch):
     monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
     ah_plugin._settings._reset()
-    events = []
-    monkeypatch.setattr(ah_plugin._sink, "emit", lambda e: events.append(e))
+    ah_plugin._on_llm_request(request=_request(), session_id="s1", api_request_id="r1")
+    retry = _decode_headers(ah_plugin._on_llm_request(
+        request=_request(), session_id="s1", api_request_id="r1"))
+    assert retry["session"]["call_index"] == 1
+    assert retry["session"]["state"] == "start"  # 同一次逻辑请求，不是第二次打开会话
 
-    mw = {}
-    class _C:
-        def register_hook(self, name, cb):
-            pass
 
-        def register_middleware(self, name, cb):
-            mw[name] = cb
-
-    ah_plugin.register(_C())
-    ah_plugin._on_pre_approval_request(session_id="s-edge", kind="approval")
-    ah_plugin._on_post_approval_response(session_id="s-edge", choice="once")
-
-    states = [e.get("agent_status", {}).get("state") for e in events]
-    assert states == ["pause", "resume"], states
-    resume_event = events[-1]["agent_status"]
-
-    req = {"model": "m", "messages": [
-        {"role": "system", "content": "sys " + "x " * 400},
-        {"role": "user", "content": "hi"}]}
-    out = mw["llm_request"](request=req, session_id="s-edge", api_request_id="r-edge-1")
-    hint = ah_plugin._codec.decode(out["request"]["extra_headers"]["X-Agent-Hint"])
-    assert hint["agent_status"]["state"] == "resume"
-    assert hint["agent_status"]["state_since_ms"] == resume_event["state_since_ms"]
-
-    out2 = mw["llm_request"](request=req, session_id="s-edge", api_request_id="r-edge-2")
-    hint2 = ah_plugin._codec.decode(out2["request"]["extra_headers"]["X-Agent-Hint"])
-    assert hint2["agent_status"]["state"] == "running"
-    # 边只发一次：第二条请求之后事件通道不会再补一条 resume。
-    assert [e.get("agent_status", {}).get("state") for e in events] == ["pause", "resume"]
-
-# ---------------- post_compaction（0.10.0：epoch 当真信号使） ----------------
-
-def _enable(ah_plugin, monkeypatch, **env):
-    """打开插件并写入任意 AGENT_HINT_<KEY> 覆盖（settings 快照随后重载）。"""
+def test_middleware_drops_cache_on_an_empty_assistant_message(ah_plugin, monkeypatch):
     monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
-    for key, val in env.items():
-        monkeypatch.setenv("AGENT_HINT_" + key.upper(), val)
     ah_plugin._settings._reset()
+    req = _request(messages=[
+        {"role": "system", "content": "sys " + LONG_PREFIX},
+        {"role": "assistant", "content": ""},
+    ])
+    hint = _decode_headers(ah_plugin._on_llm_request(request=req, session_id="s1"))
+    assert "cache_control" not in hint
 
 
-def test_post_compaction_bumps_epoch_on_rewrite(ah_plugin, monkeypatch):
-    """宿主报一次已提交压缩（kind=summarize），会话 epoch 换代——不再需要外部接缝来推。"""
-    _enable(ah_plugin, monkeypatch)
-    assert ah_plugin._state.note_call("s1")[3] == 0
-    ah_plugin._on_post_compaction(session_id="s1", old_session_id="", kind="summarize",
-                                  reason="auto", before_tokens=9000, after_tokens=1200,
-                                  messages_removed=7)
-    assert ah_plugin._state.note_call("s1")[3] == 1, "epoch must advance right after the host reports a rewrite"
-    # 返回值被宿主忽略，但契约上必须是 None（纯观察，不参与决策）
-    assert ah_plugin._on_post_compaction(session_id="s1", kind="provider_native") is None
-    assert ah_plugin._state.note_call("s1")[3] == 2
+def test_middleware_drops_cache_when_model_or_tools_change(ah_plugin, monkeypatch):
+    monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
+    ah_plugin._settings._reset()
+    first = _decode_headers(ah_plugin._on_llm_request(
+        request=_request(tools=[{"type": "function", "function": {"name": "a"}}]),
+        session_id="s1", api_request_id="r1"))
+    assert "cache_control" in first  # 第一轮没有“上一轮签名”
+    same = _decode_headers(ah_plugin._on_llm_request(
+        request=_request(tools=[{"type": "function", "function": {"name": "a"}}]),
+        session_id="s1", api_request_id="r2"))
+    assert "cache_control" in same
+    changed = _decode_headers(ah_plugin._on_llm_request(
+        request=_request(tools=[{"type": "function", "function": {"name": "b"}}]),
+        session_id="s1", api_request_id="r3"))
+    assert "cache_control" not in changed
+    back = _decode_headers(ah_plugin._on_llm_request(
+        request=_request(tools=[{"type": "function", "function": {"name": "b"}}]),
+        session_id="s1", api_request_id="r4"))
+    assert "cache_control" in back  # 签名稳定后恢复
 
 
-def test_post_compaction_bumps_unseen_session(ah_plugin, monkeypatch):
-    """压缩可能发生在第一条请求之前：这时也要抬代，否则 note_call 建状态时那代会丢。"""
-    _enable(ah_plugin, monkeypatch)
-    ah_plugin._on_post_compaction(session_id="s-fresh", kind="micro_summarize")
-    assert ah_plugin._state.note_call("s-fresh")[3] == 1
+def test_middleware_drops_cache_on_the_rewrite_round(ah_plugin, monkeypatch):
+    monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
+    ah_plugin._settings._reset()
+    ah_plugin._on_llm_request(request=_request(), session_id="s1", api_request_id="r1")
+    assert ah_plugin._state.bump_epoch("s1") == 1  # 上下文被重写 -> 新一代
+    hint = _decode_headers(ah_plugin._on_llm_request(
+        request=_request(), session_id="s1", api_request_id="r2"))
+    assert hint["session"]["epoch"] == 1
+    assert hint["session"]["state"] == "append"
+    assert "cache_control" not in hint
+    after = _decode_headers(ah_plugin._on_llm_request(
+        request=_request(), session_id="s1", api_request_id="r3"))
+    assert "cache_control" in after  # 只有重写那一轮放弃声明
 
 
-def test_post_compaction_kind_gate(ah_plugin, monkeypatch):
-    """prune_tool_results 默认不算上下文重写；epoch_on=all 时才抬代；none 时一律不抬。"""
-    _enable(ah_plugin, monkeypatch)
-    ah_plugin._state.note_call("s2")
-    ah_plugin._on_post_compaction(session_id="s2", kind="prune_tool_results")
-    assert ah_plugin._state.note_call("s2")[3] == 0, "trimming tool results leaves the message count unchanged"
-
-    _enable(ah_plugin, monkeypatch, epoch_on="all")
-    ah_plugin._on_post_compaction(session_id="s2", kind="prune_tool_results")
-    assert ah_plugin._state.note_call("s2")[3] == 1
-
-    _enable(ah_plugin, monkeypatch, epoch_on="none")
-    ah_plugin._on_post_compaction(session_id="s2", kind="summarize")
-    assert ah_plugin._state.note_call("s2")[3] == 1, "epoch_on=none turns the hook into a pure observer"
+def test_middleware_drops_cache_for_a_short_prefix(ah_plugin, monkeypatch):
+    monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
+    ah_plugin._settings._reset()
+    hint = _decode_headers(ah_plugin._on_llm_request(
+        request={"model": "mock", "messages": [{"role": "user", "content": "hi"}]},
+        session_id="s1"))
+    assert "cache_control" not in hint
 
 
-def test_post_compaction_disabled_is_noop(ah_plugin, monkeypatch):
-    """关闭态（默认）下钩子不建状态、不抬代。"""
+def test_middleware_omits_priority_when_level_is_zero(ah_plugin, monkeypatch):
+    monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
+    monkeypatch.setenv("AGENT_HINT_PRIORITY_LEVEL", "0")
+    ah_plugin._settings._reset()
+    hint = _decode_headers(ah_plugin._on_llm_request(request=_request(), session_id="s1"))
+    assert "priority_control" not in hint
+
+
+def test_middleware_folds_a_configured_priority_into_the_pair(ah_plugin, monkeypatch):
+    monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
+    monkeypatch.setenv("AGENT_HINT_PRIORITY_LEVEL", "4")
+    ah_plugin._settings._reset()
+    hint = _decode_headers(ah_plugin._on_llm_request(request=_request(), session_id="s1"))
+    assert hint["priority_control"] == {"priority": {"level": 3, "reason": "user_waiting"}}
+
+
+def test_middleware_ignores_malformed_input(ah_plugin, monkeypatch):
+    monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
+    ah_plugin._settings._reset()
+    assert ah_plugin._on_llm_request(request="not-a-dict", session_id="s1") is None
+    assert ah_plugin._on_llm_request(request={}, session_id="") is None
+
+
+def test_middleware_subagent_carries_parent_only(ah_plugin, monkeypatch):
+    monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
+    ah_plugin._settings._reset()
+    ah_plugin._state.subagent_start("s-parent", "s-child")
+    hint = _decode_headers(ah_plugin._on_llm_request(
+        request=_request(), session_id="s-child", api_request_id="r1"))
+    assert hint["session"]["parent_session_id"] == "s-parent"
+    assert hint["session"]["state"] == "start"  # 子会话的第一个请求也是 start
+    assert "derivation" not in hint["session"]
+    assert "agent_type" not in hint["session"]
+
+
+# ---------------- hooks ----------------
+
+def test_disabled_plugin_does_nothing(ah_plugin, monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_HINT_ENABLED", "0")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("AGENT_HINT_MANAGE_SINK", "ndjson")
+    ah_plugin._settings._reset()
+    assert ah_plugin._on_llm_request(request=_request(), session_id="s1") is None
+    ah_plugin._on_pre_approval_request(session_id="s1")
+    ah_plugin._on_session_finalize(session_id="s1")
+    ah_plugin.notify_compact(session_id="s1")
+    assert not (tmp_path / "agent-hint-manage.ndjson").exists()
+
+
+def test_pre_tool_call_returns_none(ah_plugin, monkeypatch):
+    monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
+    ah_plugin._settings._reset()
+    assert ah_plugin._on_pre_tool_call(session_id="s1", tool_name="t", tool_call_id="c1") is None
+
+
+def test_approval_hooks_send_pause_then_resume(ah_plugin, monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("AGENT_HINT_MANAGE_SINK", "ndjson")
+    ah_plugin._settings._reset()
+    ah_plugin._on_llm_request(request=_request(), session_id="s1", api_request_id="r1")
+    ah_plugin._on_pre_approval_request(session_id="s1")
+    ah_plugin._on_post_approval_response(session_id="s1")
+    states = [r["hint"]["session"]["state"] for r in _manage_lines(tmp_path)]
+    assert states == ["pause", "resume"]
+    edits = [r["hint"]["context_management"]["edits"][0]["type"] for r in _manage_lines(tmp_path)]
+    assert edits == ["offload", "prefetch"]
+    # manage 请求自己不是 LLM 调用：call_index 不该被它推高
+    assert _manage_lines(tmp_path)[0]["hint"]["session"]["call_index"] == 1
+
+
+def test_session_finalize_sends_stop_and_forgets_the_session(ah_plugin, monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("AGENT_HINT_MANAGE_SINK", "ndjson")
+    ah_plugin._settings._reset()
+    ah_plugin._on_session_start(session_id="s1")
+    ah_plugin._on_llm_request(request=_request(), session_id="s1", api_request_id="r1")
+    ah_plugin._on_session_finalize(session_id="s1")
+    records = _manage_lines(tmp_path)
+    assert len(records) == 1
+    hint = records[0]["hint"]
+    assert hint["session"]["state"] == "stop"
+    assert hint["context_management"]["edits"][0]["type"] == "evict"
+    assert records[0]["body"]["messages"] == []
+    assert ah_plugin._state.lineage("s1") is None
+    assert ah_plugin._state.peek("s1") == (0, 0, None)  # 会话已回收
+
+
+def test_notify_compact_bumps_epoch_and_names_the_dropped_generation(ah_plugin, monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("AGENT_HINT_MANAGE_SINK", "ndjson")
+    ah_plugin._settings._reset()
+    ah_plugin._on_llm_request(request=_request(), session_id="s1", api_request_id="r1")
+    assert ah_plugin.notify_compact("s1") is True
+    record = _manage_lines(tmp_path)[0]
+    assert record["hint"]["session"]["state"] == "compact"
+    assert record["hint"]["session"]["epoch"] == 0  # 被丢掉的那一代，不是新的一代
+    assert record["hint"]["context_management"]["edits"] == [{"type": "evict", "target": "session"}]
+    # 重写标记已置位：下一轮请求不声明缓存，且 epoch 已经抬到 1
+    hint = _decode_headers(ah_plugin._on_llm_request(
+        request=_request(), session_id="s1", api_request_id="r2"))
+    assert hint["session"]["epoch"] == 1
+    assert "cache_control" not in hint
+
+
+def test_register_wires_every_declared_capability(ah_plugin, monkeypatch):
+    """manifest 声明的能力必须与真实注册一致（上游能力探针会校验）。"""
     monkeypatch.setenv("AGENT_HINT_ENABLED", "0")
     ah_plugin._settings._reset()
-    ah_plugin._on_post_compaction(session_id="s3", kind="summarize")
-    assert ah_plugin._state.note_call("s3")[3] == 0
+    registry = _Registry()
+    ah_plugin.register(registry)
+    assert set(registry.hooks) == {
+        "on_session_start", "on_session_end", "on_session_finalize",
+        "pre_tool_call", "post_tool_call",
+        "pre_approval_request", "post_approval_response",
+        "subagent_start", "subagent_stop", "post_api_request",
+        "post_compaction",
+    }
+    assert set(registry.middleware) == {"llm_request"}

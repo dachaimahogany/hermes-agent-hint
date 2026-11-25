@@ -3,23 +3,25 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Hermes >= 0.21.6](https://img.shields.io/badge/hermes-%E2%89%A50.21.6-8A2BE2.svg)](https://github.com/NousResearch/hermes-agent)
 [![stdlib only](https://img.shields.io/badge/dependencies-none-brightgreen.svg)](#safety-properties)
-[![tests](https://img.shields.io/badge/tests-36%20passing-brightgreen.svg)](#tests)
+[![tests](https://img.shields.io/badge/tests-72%20passing-brightgreen.svg)](#tests)
 [![measured impact](https://img.shields.io/badge/report-benchmark%20%2B%20field%20test-orange.svg)](docs/benchmark-report.md)
 
 **English** · **[中文](#中文)**
 
 > Give your inference engine — scheduler, gateway, KV-cache manager — a **standard,
-> machine-readable view of the agent session** driving each request: who the session is, where it
-> is in its lifecycle, how urgent it is, and what it is likely to do next.
+> machine-readable view of the agent session** driving each request: which session it is, where in
+> the session's call sequence it sits, whether a person is waiting on it, and how long to hold the
+> prefix it is about to reuse.
 
-The plugin attaches a single HTTP header — `X-Agent-Hint` — to **main LLM requests only**, and
-optionally emits session lifecycle events out-of-band. It never touches the request body, never
-modifies Hermes core, and is **off by default**.
+The plugin attaches a single HTTP header — `X-Agent-Hint` — to **main LLM requests only**, and sends
+**manage requests** (empty-body calls carrying exactly one lifecycle verb) when a session pauses,
+resumes, stops, or is compacted. It never touches the request body, never modifies Hermes core, and
+is **off by default**.
 
 ```
 LLM request ──► llm_request middleware ──► + X-Agent-Hint header ──► inference engine
                                           ▲
-   hooks (session / tool / approval / subagent / api) ──► status events (ndjson | http | none)
+  hooks (session / tool / approval / subagent / compaction) ──► manage request (pause | resume | stop | compact)
 ```
 
 ## Why
@@ -78,17 +80,18 @@ Every key is optional — the defaults are the safe defaults.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `enabled` | `false` | Master switch. Off = no header, no events. |
-| `agent_type` | `hermes` | Value written to `session.agent_type`. Set per deployment/role. |
-| `priority_level` | `3` | `priority.level`, folded to the two-level contract: `>= 3` becomes `3` (a person is waiting), anything else becomes `1`. `<= 0` omits the whole `priority` block. |
-| `priority_reason` | `user_waiting` | `priority.reason` text. |
-| `status_sink` | `none` | Event transport: `ndjson`, `http`, or `none`. |
-| `status_url` | *(empty)* | Target URL for the `http` sink. Empty = no network traffic at all. |
-| `suspend_after_s` | `0` | Emit `suspend` if an approval stays pending this long. `0` disables. |
-| `cache_pin_end` | `auto` | Breakpoint position (`range.end`) of the single `ephemeral` entry. `auto` (default) = the end of the current logical input, system prompt included; `0` emits no declaration; an integer pins an explicit position. Historical name, kept for config compatibility. |
-| `cache_ttl_s` | `auto` | Retention seconds for the ephemeral range. `auto` derives it from the observed gap (next tool budget, else the inter-call interval, else 300 s, doubled and clamped to 60–3600); `0` sends no declaration at all; a number fixes it. |
-| `cache_task_end` | `0` | Message index of the task-description end. When wider than `cache_pin_end` it becomes the position of the **single** breakpoint; the declaration itself stays one entry. `0` uses `cache_pin_end`. |
-| `next_action_map` | *(empty)* | Generic `prediction.next_action` heuristic (JSON). Empty = omit. |
+| `enabled` | `false` | Master switch. Off = no header, no manage request. |
+| `priority_level` | `3` | `priority_control.priority.level`, folded to the two-level contract: `>= 3` becomes `3` (a person is waiting), anything else becomes `1`. `<= 0` omits the whole block. |
+| `cache_pin_end` | `auto` | `cache_control.msg_offset`. `auto` (default) = this request's wire message count, system prompt included; `0` emits no declaration; an integer pins an explicit position (out of range = no declaration). |
+| `cache_ttl_s` | `auto` | `cache_control.ttl_s`. `auto` derives it from the observed gap (else 300 s), doubled and clamped to 60–3600; `0` sends no declaration at all; a number fixes it. |
+| `epoch_on` | `summarize,micro_summarize,provider_native` | Which `post_compaction` kinds count as a context rewrite and bump `session.epoch`: a comma list over the host's closed set (`summarize`, `micro_summarize`, `prune_tool_results`, `provider_native`), or `all` / `none`. `prune_tool_results` only trims tool results and leaves the message count unchanged, so it does not count by default. |
+| `manage_sink` | `none` | Manage-request transport: `ndjson`, `http`, or `none`. |
+| `manage_url` | *(empty)* | Target URL for the `http` sink. Empty = no network traffic at all. |
+| `manage_model` | *(empty)* | `model` of the placeholder manage body. Empty omits the key. |
+| `manage_token_env` | `AGENT_HINT_TOKEN` | Name of the env var holding the bearer token for the `http` sink. The token travels in a header, never inside the hint. |
+| `manage_timeout_s` | `5` | Per-request timeout, clamped to 1–30. |
+| `manage_max_retries` | `1` | Retries per manage request, clamped to 0–3. |
+| `manage_queue_limit` | `64` | Bounded queue depth for the `http` sink; overflow drops the newest, clamped to 1–1024. |
 
 Example:
 
@@ -98,43 +101,63 @@ plugins:
     agent-hint:
       settings:
         enabled: true
-        agent_type: my-agent
-        status_sink: http
-        status_url: http://127.0.0.1:8080/agent-status
-        next_action_map: '{"search_": ["summarize_run", 6, "tool"], "__default__": [null, 0, "tool"]}'
+        priority_level: 3
+        cache_ttl_s: auto
+        epoch_on: summarize,micro_summarize,provider_native
+        manage_sink: http
+        manage_url: http://127.0.0.1:8080/v1/chat/completions
+        manage_model: Qwen3-8B
 ```
 
 ## The `X-Agent-Hint` header
 
-`base64url(UTF-8 JSON)`, padding stripped — header values must stay ASCII and single-line. Field
-classes carried in the JSON:
+`base64url(UTF-8 JSON)`, padding stripped — header values must stay ASCII and single-line. Four
+blocks, and only four:
 
-| Class | Fields | Notes |
+| Block | Fields | Notes |
 |---|---|---|
-| `session` | `session_id`, `agent_type`, `call_index`, `epoch` | Identity + call counter; `epoch` increments when the context is rewritten. |
-| `agent_status` | `state` (`running` / `pause` / `resume` / `finalize`), `state_since_ms` | Lifecycle. The header carries the four-value vocabulary only; `resume` / `finalize` are **one-shot edges** that describe exactly one request. `reason` / `tools` ride the event channel. |
-| `priority` | `level`, `reason` | Soft priority hint; the engine decides. |
-| `cache_control` | `ephemeral`, `ttl_s`, `range` | One retention declaration for the session's prefix (`pin` is accepted by consumers as a retired alias). |
-| `prediction` | `latency_ms`, `output_tokens`, `interval_ms`, `next_action`, `remaining_calls` | Statistics are measured; `next_action`/`remaining_calls` are **heuristics** and are omitted unless `next_action_map` is configured. |
+| `session` | `session_id`, `state`, `call_index`, `epoch`, optional `parent_session_id` | `state` is one of `start` / `append` / `pause` / `resume` / `stop` / `compact`. `start` appears exactly once per fresh session; every other ordinary request is `append`. `epoch` increments when the context is rewritten — driven by the host's `post_compaction` hook, gated by `epoch_on`. |
+| `context_management` | `manage_request`, `edits[]` | Present on **manage requests only**; an edit carries only `type` and `target`, and `target` is always `session` (the version lives in `session.epoch`, not in the edit). |
+| `priority_control` | `priority.level`, `priority.reason` | `level` is `3` (a person is waiting) or `1` (background). `reason` is **derived** from `level`, never configured separately — the two cannot contradict each other. |
+| `cache_control` | `type`, `ttl_s`, `msg_offset` | One object, `type` always `ephemeral`. `msg_offset` is this request's wire message count (the system prompt counts as message 1). |
 
-The four wire states are ordered edges, not a level: `pause` stays sticky for as long as somebody is
-waiting (approval, clarification, suspend), `resume` describes **only the first request after the
-release**, `finalize` describes **only the first request after the session ended** (if the host sends
-another request afterwards it is back to `running`). Internal words never reach the wire: `tool` folds
-to `running` in the header and survives only on the event channel; `suspend` / `timeout` / `checkpoint`
-fold to `pause` on both channels (the reason travels in `agent_status.reason`).
+`ttl_s = clamp(round(last observed interval × 2), 60, 3600)` — declare the hold you are about to
+reuse, not a fixed guess. The declaration is suppressed on a round that rewrites the context, on a
+round whose model or tool set changed, on a prefix shorter than one cache block, and on any round
+that carries an empty assistant message.
 
-`strict_priority` is deliberately **not** emitted: a client-side plugin must not be able to claim a
-hard priority. Trust decisions belong to the control plane.
+Deliberately **not** emitted: `agent_status`, `prediction`, `derivation`, `agent_type`,
+`strict_priority`, `cache_control[].range`/`unit`, `latency_control`. The plugin's internal state
+(`running` / `tool` / `pause` / `finalize`) never reaches the wire — an engine does not need to know
+what the agent is doing, only whether to keep or drop the context after this turn. A client-side
+plugin must not be able to claim a hard priority either; trust decisions belong to the control plane.
 
-Status events (same shapes, plus a monotonic `X-Agent-Hint-Seq` on the `http` sink) are emitted for
-session start/end, tool start/finish, approval wait/resume, sub-agent start/stop, and finalize.
+Auxiliary calls — title generation, summaries requested for some other purpose, anything carrying a
+non-empty `purpose` — carry **no hint at all**.
+
+### Manage requests
+
+`pause` / `resume` / `stop` / `compact` each own **one** dedicated request: `POST <manage_url>`, an
+empty placeholder body (`{"model": …, "messages": [], "stream": false}`) and the verb in the header.
+A consumer must accept an empty `messages` list when `context_management.manage_request` is true.
+
+| Verb | `edits[0].type` | Sent when |
+|---|---|---|
+| `pause` | `offload` | an approval is raised and the turn is blocked on a person |
+| `resume` | `prefetch` | that approval is answered |
+| `stop` | `evict` | the session finalizes |
+| `compact` | `evict` | the context is compacted; the hint carries `epoch - 1`, the generation that was dropped |
+
+Manage requests are deduped per session (two consecutive identical verbs carry no new information),
+never counted in `call_index`, and go through the same fail-safe sink as everything else.
 
 ## Safety properties
 
 - **Off by default.** Nothing is injected and nothing is sent until you enable it.
-- **No network unless you point it at a URL.** `status_sink` defaults to `none`; `ndjson` writes
-  locally, `http` sends only to `status_url`.
+- **No network unless you point it at a URL.** `manage_sink` defaults to `none`; `ndjson` writes
+  locally, `http` sends only to `manage_url`.
+- **The token stays out of the hint.** A bearer token goes in an `Authorization` header on the
+  manage request; the hint itself is treated as engine-visible log material.
 - **Fail-safe.** Every hook and every sink swallows its own errors (warn-once to stderr) — a broken
   hint can never break a turn. The middleware returns the request untouched on any failure.
 - **Pure stdlib, no core access.** Only `ctx.register_hook` / `ctx.register_middleware` /
@@ -156,7 +179,7 @@ Hook payloads are read defensively and by keyword; a hook whose payload changes 
 ## Tests
 
 ```bash
-python3 -m pytest tests/     # 36 tests, no network, no Hermes install required
+python3 -m pytest tests/     # 85 tests, no network, no Hermes install required
 ```
 
 ## Verification
@@ -169,12 +192,12 @@ v0.21.6 checkout):
    matching registrations), security scan, and "no core override".
 2. **Standalone turn + real engine** — installed as the *only* plugin into a clean `HERMES_HOME`
    (no bundle, no companion plugins), a real `hermes -z` turn produced two `X-Agent-Hint` headers
-   (`call_index` 1→2) and the event sequence `running → tool → running → finalize`; with the plugin
-   disabled the same run was completely silent. The header bytes emitted by this plugin's own
-   `_builder`/`_codec` were then sent to a MindIE-Motor scheduler, whose log shows the session being
-   pinned — `session affinity hit session_id=… instance_id=4` after a first request with
-   `prio=3 aff=fresh` and a second with `prio=3 aff=hit`, while an identical request without the
-   header logged `prio=None aff=-`.
+   (`state=start` then `append`, `call_index` 1→2, `cache_control.msg_offset` tracking the wire
+   message count) and a `stop` manage request at finalize; with the plugin disabled the same run was
+   completely silent. The header bytes emitted by this plugin's own `_builder`/`_codec` were then sent
+   to a MindIE-Motor scheduler, whose log shows the session being pinned — `session affinity hit
+   session_id=… instance_id=4` after a first request with `prio=3 aff=fresh` and a second with
+   `prio=3 aff=hit`, while an identical request without the header logged `prio=None aff=-`.
 3. **Benchmark + field test** — cold/warm prefix-cache measurement, hint-off/on routing comparison,
    and 9 captured real-agent requests, with the numbers in the [report](docs/benchmark-report.md).
 
@@ -189,15 +212,16 @@ MIT — see [`LICENSE`](LICENSE).
 **中文** · **[English](#agent-hint)**
 
 > 给下游推理引擎（调度器 / 网关 / KV 缓存管理器）一个**标准化、机器可读的「agent 会话视图」**：
-> 这个请求属于哪个会话、会话处在生命周期哪个阶段、有多紧急、接下来大概要做什么。
+> 这个请求属于哪个会话、在会话的调用序列里排第几、是否有人正在等它、前缀该留多久。
 
-插件把**单个 HTTP 头 `X-Agent-Hint`** 附加到**主 LLM 请求**上，并可按需把会话生命周期事件走旁路
-上报。它**绝不修改请求体**、**绝不改动 Hermes 内核**，且**默认关闭**。
+插件把**单个 HTTP 头 `X-Agent-Hint`** 附加到**主 LLM 请求**上；当会话暂停 / 恢复 / 结束 / 被压缩时，
+另发一条 **manage 请求**（空占位体，只带一个生命周期动词）。它**绝不修改请求体**、**绝不改动 Hermes
+内核**，且**默认关闭**。
 
 ```
 LLM 请求 ──► llm_request 中间件 ──► 附加 X-Agent-Hint 头 ──► 推理引擎
                                     ▲
-   hooks（会话 / 工具 / 审批 / 子代理 / API）──► 状态事件（ndjson | http | none）
+   hooks（会话 / 工具 / 审批 / 子代理 / 压缩）──► manage 请求（pause | resume | stop | compact）
 ```
 
 ## 为什么需要它
@@ -251,17 +275,18 @@ hermes plugins enable agent-hint
 
 | 键 | 默认 | 含义 |
 |---|---|---|
-| `enabled` | `false` | 总开关。关闭 = 不发 header、不发事件。 |
-| `agent_type` | `hermes` | 写入 `session.agent_type` 的值，按部署/角色自定。 |
-| `priority_level` | `3` | `priority.level`，折叠进二值域：`>= 3` 记为 `3`（有人正在等），其余记为 `1`。`<= 0` 则整个 `priority` 段不发射。 |
-| `priority_reason` | `user_waiting` | `priority.reason` 文本。 |
-| `status_sink` | `none` | 事件通道：`ndjson`、`http`、`none`。 |
-| `status_url` | *(空)* | `http` 通道的目标地址。留空 = 完全不产生网络流量。 |
-| `suspend_after_s` | `0` | 审批挂起超过该秒数时发射 `suspend`；`0` 关闭。 |
-| `cache_pin_end` | `auto` | 单条 `ephemeral` 的断点位置（`range.end`）。`auto`（默认）= 当前逻辑输入末尾（含 system）；`0` 不发声明；填整数则显式指定位置。历史命名，保留以兼容既有配置。 |
-| `cache_ttl_s` | `auto` | ephemeral 保留秒数。`auto` 按运行时信号推导（下一次工具预算 → 请求间隔 → 默认 300s，乘 2 后钳到 60–3600）；`0` 不再发送任何声明；填数字则固定。 |
-| `cache_task_end` | `0` | 任务说明末尾的消息下标。比 `cache_pin_end` 更宽时，它成为**唯一那条**断点的位置；声明本身仍只有一条。`0` 表示沿用 `cache_pin_end`。 |
-| `next_action_map` | *(空)* | 通用的 `prediction.next_action` 启发式（JSON）。留空 = 不发射。 |
+| `enabled` | `false` | 总开关。关闭 = 不发 header、不发 manage 请求。 |
+| `priority_level` | `3` | `priority_control.priority.level`，折叠进二值域：`>= 3` 记为 `3`（有人正在等），其余记为 `1`。`<= 0` 则整段不发射。 |
+| `cache_pin_end` | `auto` | `cache_control.msg_offset`。`auto`（默认）= 本请求的线格式消息条数（含 system）；`0` 不发声明；填整数则显式指定位置（越界即不发）。 |
+| `cache_ttl_s` | `auto` | `cache_control.ttl_s`。`auto` 按观测到的间隔推导（无观测则 300s），乘 2 后钳到 60–3600；`0` 不再发送任何声明；填数字则固定。 |
+| `epoch_on` | `summarize,micro_summarize,provider_native` | 哪些 `post_compaction` 的 kind 算「上下文重写」、要抬 `session.epoch`：宿主的闭合集（`summarize`、`micro_summarize`、`prune_tool_results`、`provider_native`）里挑，或写 `all` / `none`。`prune_tool_results` 只裁短工具结果、消息条数不变，默认不算。 |
+| `manage_sink` | `none` | manage 请求的通道：`ndjson`、`http`、`none`。 |
+| `manage_url` | *(空)* | `http` 通道的目标地址。留空 = 完全不产生网络流量。 |
+| `manage_model` | *(空)* | 占位体里的 `model`。留空则整个键省略。 |
+| `manage_token_env` | `AGENT_HINT_TOKEN` | 存放 `http` 通道 bearer token 的环境变量名。token 只进 header，绝不进 hint。 |
+| `manage_timeout_s` | `5` | 单次请求超时，钳在 1–30。 |
+| `manage_max_retries` | `1` | 单次 manage 请求的重试次数，钳在 0–3。 |
+| `manage_queue_limit` | `64` | `http` 通道的有界队列深度，满则丢最新的，钳在 1–1024。 |
 
 示例：
 
@@ -271,33 +296,58 @@ plugins:
     agent-hint:
       settings:
         enabled: true
-        agent_type: my-agent
-        status_sink: http
-        status_url: http://127.0.0.1:8080/agent-status
-        next_action_map: '{"search_": ["summarize_run", 6, "tool"], "__default__": [null, 0, "tool"]}'
+        priority_level: 3
+        cache_ttl_s: auto
+        epoch_on: summarize,micro_summarize,provider_native
+        manage_sink: http
+        manage_url: http://127.0.0.1:8080/v1/chat/completions
+        manage_model: Qwen3-8B
 ```
 
 ## `X-Agent-Hint` 头
 
-`base64url(UTF-8 JSON)`，去掉 padding —— header 值必须保持 ASCII 与单行。JSON 中承载的字段类别：
+`base64url(UTF-8 JSON)`，去掉 padding —— header 值必须保持 ASCII 与单行。**只有四块**：
 
-| 类别 | 字段 | 说明 |
+| 块 | 字段 | 说明 |
 |---|---|---|
-| `session` | `session_id`、`agent_type`、`call_index`、`epoch` | 身份 + 调用计数；上下文被重写时 `epoch` 递增。 |
-| `agent_status` | `state`（`running` / `pause` / `resume` / `finalize`）、`state_since_ms` | 生命周期。请求头只发四值；`resume` / `finalize` 是**一次性边**，只描述紧接的那一条请求。`reason` / `tools` 走事件通道。 |
-| `priority` | `level`、`reason` | 软优先级提示；最终由引擎决定。 |
-| `cache_control` | `ephemeral`、`ttl_s`、`range` | 针对会话前缀的一条保留声明（消费侧仍接受 `pin` 作为已退役别名）。 |
-| `prediction` | `latency_ms`、`output_tokens`、`interval_ms`、`next_action`、`remaining_calls` | 统计值为实测量；`next_action`/`remaining_calls` 属**启发式**，未配置 `next_action_map` 时不发射。 |
+| `session` | `session_id`、`state`、`call_index`、`epoch`，可选 `parent_session_id` | `state` 取 `start` / `append` / `pause` / `resume` / `stop` / `compact`。`start` 在每个新会话里只出现一次；其余普通请求一律 `append`。上下文被重写时 `epoch` 递增 —— 由宿主的 `post_compaction` 钩子驱动，口径见 `epoch_on`。 |
+| `context_management` | `manage_request`、`edits[]` | **只有 manage 请求**带这一块；每条 edit 只写 `type` 与 `target`，`target` 恒为 `session`（版本号在 `session.epoch` 里，不在 edit 里）。 |
+| `priority_control` | `priority.level`、`priority.reason` | `level` 取 `3`（有人正在等）或 `1`（后台）。`reason` 由 `level` **推导**，不单独配置 —— 二者不可能互相矛盾。 |
+| `cache_control` | `type`、`ttl_s`、`msg_offset` | 单一对象，`type` 恒为 `ephemeral`。`msg_offset` 是本请求的线格式消息条数（system 提示词算第 1 条）。 |
 
-`strict_priority` **有意不发射**：客户端插件不应有能力声明硬优先级，信任决策属于控制面。
+`ttl_s = clamp(round(上次观测间隔 × 2), 60, 3600)` —— 声明你即将复用的那段保留，而不是一个拍死的猜值。
+以下四种轮次**不发**这条声明：上下文被重写的那一轮、模型或工具集发生变化的那一轮、前缀不足一个缓存块的
+请求、以及带空 assistant 消息的请求。
 
-状态事件（结构同上，`http` 通道额外带单调递增的 `X-Agent-Hint-Seq`）覆盖：会话开始/结束、工具
-开始/结束、审批等待/恢复、子代理开始/停止、以及 finalize。
+**有意不发射**：`agent_status`、`prediction`、`derivation`、`agent_type`、`strict_priority`、
+`cache_control[].range`/`unit`、`latency_control`。插件内部状态（`running` / `tool` / `pause` /
+`finalize`）永不上线 —— 引擎不需要知道 agent 此刻在干什么，只需要知道这一轮之后要不要卸载上下文。
+客户端插件也不应有能力声明硬优先级，信任决策属于控制面。
+
+辅助调用（标题生成、为别的目的要的摘要、任何带非空 `purpose` 的调用）**完全不带 hint**。
+
+### manage 请求
+
+`pause` / `resume` / `stop` / `compact` 各由**一次**专用请求承载：`POST <manage_url>`，空占位体
+（`{"model": …, "messages": [], "stream": false}`），动词放在 header 里。消费侧在
+`context_management.manage_request` 为真时**必须接受空的 `messages` 列表**。
+
+| 动词 | `edits[0].type` | 何时发 |
+|---|---|---|
+| `pause` | `offload` | 弹出审批、这一轮被人阻塞 |
+| `resume` | `prefetch` | 审批得到答复 |
+| `stop` | `evict` | 会话 finalize |
+| `compact` | `evict` | 上下文被压缩；hint 携带 `epoch - 1`，即被丢掉的那一代 |
+
+manage 请求按会话去重（连续同一个动词不带来新信息）、不计入 `call_index`，并与其他一切共用同一条
+故障安全的出口。
 
 ## 安全属性
 
 - **默认关闭。** 未启用前不注入任何内容、不外发任何数据。
-- **不配 URL 就无网络。** `status_sink` 默认 `none`；`ndjson` 只写本地，`http` 只发往 `status_url`。
+- **不配 URL 就无网络。** `manage_sink` 默认 `none`；`ndjson` 只写本地，`http` 只发往 `manage_url`。
+- **token 不进 hint。** bearer token 放在 manage 请求的 `Authorization` 头里；hint 本身按「引擎可见的
+  日志材料」对待。
 - **故障安全。** 每个 hook 与每个 sink 都自吞异常（只向 stderr 警告一次）—— 坏掉的 hint 永远无法
   破坏一次对话；中间件在任何失败情况下原样返回请求。
 - **纯标准库，不碰内核。** 仅使用 `ctx.register_hook` / `ctx.register_middleware` / `ctx.get_config`；
@@ -316,7 +366,7 @@ hook 载荷按关键字防御式读取；若某 hook 的载荷结构变化，会
 ## 测试
 
 ```bash
-python3 -m pytest tests/     # 48 个用例，无网络，无需安装 Hermes
+python3 -m pytest tests/     # 85 个用例，无网络，无需安装 Hermes
 ```
 
 ## 验证
@@ -327,55 +377,14 @@ python3 -m pytest tests/     # 48 个用例，无网络，无需安装 Hermes
    `config_schema`、能力探针（隔离运行 `register()`，声明的 hooks/中间件与实际注册一致）、安全扫描、
    以及「未覆盖内核」。
 2. **独立插件跑真实对话 + 真实引擎** —— 作为**唯一**插件装入干净的 `HERMES_HOME`（无 bundle、无配套
-   插件），一次真实的 `hermes -z` 对话产生了两个 `X-Agent-Hint` 头（`call_index` 1→2）与事件序列
-   `running → tool → running → finalize`；关闭插件后同一次运行完全静默。随后把本插件自己的
-   `_builder`/`_codec` 产出的 header 字节发给 MindIE-Motor 调度器，其日志显示会话被钉住 ——
-   首个请求 `prio=3 aff=fresh`、第二个 `prio=3 aff=hit` 并打出
-   `session affinity hit session_id=… instance_id=4`，而同样内容不带 header 的请求记为
-   `prio=None aff=-`。
+   插件），一次真实的 `hermes -z` 对话产生了两个 `X-Agent-Hint` 头（`state=start` 后 `append`，
+   `call_index` 1→2，`cache_control.msg_offset` 跟随线格式消息条数），并在 finalize 时发出一次 `stop`
+   manage 请求；关闭插件后同一次运行完全静默。随后把本插件自己的 `_builder`/`_codec` 产出的 header
+   字节发给 MindIE-Motor 调度器，其日志显示会话被钉住 —— 首个请求 `prio=3 aff=fresh`、第二个
+   `prio=3 aff=hit` 并打出 `session affinity hit session_id=… instance_id=4`，而同样内容不带 header
+   的请求记为 `prio=None aff=-`。
 3. **benchmark + 真机验证** —— 前缀缓存冷暖对照、hint 关/开的路由对照、以及 9 条真实 agent 请求抓取，
    数字见[报告](docs/benchmark-report.zh-CN.md)。
-
-## 变更记录
-
-- **0.10.0** —— `session.epoch` 从「接缝构造」升级成「宿主真信号」：
-  - 注册宿主自 v0.21.6 起提供的 **`post_compaction`** 钩子（`hermes_cli/plugins.py:203`，
-    fire 点 `agent/compaction_events.py:239`）：自动/手动压缩、overflow 恢复、网关 `/compress`、
-    Codex app-server 压缩、微压缩、工具结果裁剪，**每次已提交压缩**回调一次，携带
-    `kind / reason / before_tokens / after_tokens / messages_removed`。
-  - epoch 换代口径落在「逻辑输入被重写」的 kind：默认 `summarize` / `micro_summarize` /
-    `provider_native`；`prune_tool_results` 只裁短工具结果、消息条数不变，默认**不**抬代。
-    `AGENT_HINT_EPOCH_ON` 可覆盖（逗号列表 / `all` / `none`）。
-  - `_state.bump_epoch()` 对未见过的会话也生效（压缩可能发生在首条请求之前）；`set_epoch_provider`
-    旁路保留。此前 epoch 只能由外部调接缝或注入 provider 推进，真机用户压缩后 epoch 恒 0。
-  - 单测 66 → 70（钩子驱动抬代、未见会话、kind 闸门、关闭态 no-op），既有用例的
-    「未知会话 `bump_epoch` 返回 0」断言随之更正为返回新 epoch。- **0.9.0** —— 0.8.0 之后的三处修正（RFC §1.3 / §3.3.5 / §3.4，以及四值事件词表）：
-  - **辅助请求整段豁免**：`auxiliary=1` 或 `purpose` 属 `{compaction, summarization, summary, title}`
-    的请求不发 hint，也不推进 `call_index`。此前压缩/摘要请求同样带 header，消费侧会把
-    「为压缩服务的请求」当成主线请求统计。
-  - **`priority.reason` 折叠进 RFC 词表** `{user_waiting, critical_path, background}`：
-    宿主自造的 `continuation: tool_followup` 一类先按冒号前缀取词表内前缀，词表外再按档位
-    兜底（免排队档 `user_waiting`、背景档 `background`），不再把原样词发上线缆。
-  - **事件通道补发 `resume`**：`post_approval_response` 现在报 `resume`（原先折成 `running`），
-    与请求头同一时刻、同一 `state_since_ms`，且只报一次 —— 事件词表四值
-    （`running` / `pause` / `resume` / `finalize`）在事件通道与请求头两条通道上同表。
-  - 另：`AGENT_HINT_LINEAGE` 供部署方声明 fork 血缘（Hermes 原生只有 spawn）；
-    会话级 finalize 模式并入 `finalize_on`（默认仍是 `session_end`）。
-  - 单测 48 → 66：新增 `tests/test_field_sending.py`（逐字段走真实注册 + 真实中间件）
-    与「放行只报一条 `resume` 事件、且与请求头 `state_since_ms` 一致」用例。
-- **0.8.0** —— 状态语义对齐四值契约（`AGENT_STATUS_STATE_DESIGN.md` §2.3 / §4.3 / §4.4）：
-  - 审批放行后，**下一条**请求头带一次 `resume`（`_state.mark_resume()`），其后回 `running`。
-    此前放行只发事件、请求头直接回 `running`，消费侧永远看不到「刚被放行」这个边。
-  - 会话结束后，**下一条**请求头带一次 `finalize`；再来的请求才算新一轮（`running` +
-    补发 running 事件）。此前 `note_call()` 一进来就把 `finalize` 翻成 `running`，终态
-    从未上过头。
-  - 同 `api_request_id` 的重试原样复用上一次结论：`call_index` 不虚增，也不会把一次性边
-    二次消耗掉。
-  - 内部状态词不再泄漏到线缆：请求头 `tool → running`、`suspend/timeout/checkpoint → pause`；
-    事件通道保留 `tool`，但 `suspend` 同样折成 `pause`（原先审批等超时会发 `suspend` 事件，
-    那是消费侧不认识的词）。
-  - 单测 36 → 48：新增四条一次性边用例（resume 只发一条 / finalize 先发后回 running /
-    重试不消耗边 / 新挂起覆盖旧放行）与线缆折叠用例，外加一条走真实 hooks 的端到端断言。
 
 ## 许可
 
